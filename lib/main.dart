@@ -70,10 +70,17 @@ class AppConfig {
   final int idleTalkMinSec;
   final int idleTalkMaxSec;
 
+  final int dedupeRecentTurns;
+  final int dedupeHammingThreshold;
+  final int dedupePromptHints;
+
   AppConfig({
     required this.geminiApiKey,
     required this.idleTalkMinSec,
     required this.idleTalkMaxSec,
+    required this.dedupeRecentTurns,
+    required this.dedupeHammingThreshold,
+    required this.dedupePromptHints,
   });
 }
 
@@ -316,6 +323,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   bool _quiet = false;
   DateTime? _quietUntil;
 
+  _DedupeState _dedupe = _DedupeState([]);
+  String? _statePath;
+  static const String _stateFileName = "nondesu_state.json";
+
   // Minimal "LLM not wired yet" talk pool
   final _localFallbackPool = const [
     "雨音って、都市のノイズをちょっとだけ丸くするよね。",
@@ -356,6 +367,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       // ここで return しても良いが、アバター表示だけ先に見たいなら return しない
       // return;
     }
+    await _loadDedupeState();
     await windowManager.setSize(pack.windowSize);
     _scheduleNextIdle();
     setState(() {});
@@ -515,7 +527,6 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       final key = (obj["gemini_api_key"] ?? "").toString().trim();
       if (key.isEmpty || key == "PASTE_YOUR_KEY_HERE") return null;
 
-      // idle interval
       int readInt(String k, int def) {
         final v = obj[k];
         if (v is int) return v;
@@ -524,6 +535,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         return def;
       }
 
+      // idle interval
       final minSec = readInt("idle_talk_min_sec", 30);
       final maxSec = readInt("idle_talk_max_sec", 90);
 
@@ -534,7 +546,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return AppConfig(
         geminiApiKey: key,
         idleTalkMinSec: safeMin,
-        idleTalkMaxSec: safeMax,
+        idleTalkMaxSec: safeMax, 
+        dedupeRecentTurns: readInt("dedupe_recent_turns", 120),
+        dedupeHammingThreshold: readInt("dedupe_hamming_threshold", 10),
+        dedupePromptHints: readInt("dedupe_prompt_hints", 10),
       );
     } catch (e, st) {
       await _logEvent("error", {
@@ -612,8 +627,36 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         userPrompt: userPrompt,
       );
 
+      // 重複除外チェック
+      final reason = _dedupeReason(t);
+      if (reason != null) {
+        await _logEvent("dedupe_reject", {
+          "reason": reason,
+          "state_path": _statePath,
+          "text": _trimForLog(t.text),
+          "debug_line_id": t.debugLineId,
+        });
+
+        // フォールバック台詞（短い固定セット）
+        final fallback = MascotTurn(
+          v: 1,
+          text: "…さっきと話題が近い。別の話にしよ。",
+          emotion: Emotion.think,
+          choiceProfile: t.choiceProfile,
+          choices: t.choices,
+          debugLineId: "local.dedupe.skip",
+        );
+
+        setState(() => _turn = fallback);
+        _startMouthFlap();
+        await _recordForDedupe(fallback);
+        await _logEvent("turn", {"mode": "idle", "turn": fallback.toLogJson()});
+        return;
+      }
+
       setState(() => _turn = t);
       _startMouthFlap();
+      await _recordForDedupe(t);
       await _logEvent("turn", {"mode": "idle", "turn": t.toLogJson()});
     } catch (e, st) {
       await _logEvent("error", {
@@ -733,6 +776,54 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         ],
       ),
     );
+  }
+
+  String? _dedupeReason(MascotTurn t) {
+    final cfg = _config;
+    if (cfg == null) return null;
+
+    // debug_line_id があるなら最優先で弾く（安い）
+    final id = t.debugLineId;
+    if (id != null && id.isNotEmpty) {
+      for (final e in _dedupe.recent) {
+        if (e.debugLineId == id) return "debug_line_id_dup";
+      }
+    }
+
+    // text fingerprint
+    final th = "sha256:${sha256.convert(utf8.encode(t.text)).toString()}";
+    final sh = _simhash64(t.text);
+
+    for (final e in _dedupe.recent) {
+      if (e.textHash == th) return "exact_text_hash_dup";
+      final prev = _parseHex64(e.simhashHex);
+      final d = _hamming64(sh, prev);
+      if (d <= cfg.dedupeHammingThreshold) {
+        return "simhash_near_dup(d=$d)";
+      }
+    }
+    return null;
+  }
+
+  Future<void> _recordForDedupe(MascotTurn t) async {
+    final cfg = _config;
+    if (cfg == null) return;
+
+    final th = "sha256:${sha256.convert(utf8.encode(t.text)).toString()}";
+    final sh = _hex64(_simhash64(t.text));
+    final entry = _DedupeEntry(
+      ts: DateTime.now().toIso8601String(),
+      textHash: th,
+      simhashHex: sh,
+      debugLineId: t.debugLineId,
+      hint: _hintOf(t.text),
+    );
+
+    _dedupe.recent.add(entry);
+
+    final f = await _getStateFile();
+    final maxEntries = cfg.dedupeRecentTurns;
+    await _dedupe.save(f, maxEntries: maxEntries);
   }
 
   // ===== Minimal logger (very small) =====
@@ -1003,9 +1094,32 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       b.writeln("TOPIC_SNIPPET: ${topic["snippet"] ?? ""}");
       b.writeln("TOPIC_URL: ${topic["url"] ?? ""}");
     }
+    // 直近の重複除外ヒント
+    final hints = _dedupe.buildHints(maxHints: _config?.dedupePromptHints ?? 10);
+    if (hints.isNotEmpty) {
+      b.writeln("AVOID_SAME_TOPICS:");
+      for (final h in hints) {
+        b.writeln("- $h");
+      }
+      b.writeln("Rule: 上の話題と同じ内容・同じ結論・同じ例えを避け、別の観察や別角度の雑談にする。");
+    }
+    
     b.writeln("");
     b.writeln("次の1ターンをJSONで返して。textは短く、URLは入れない。");
     return b.toString();
+  }
+
+  Future<File> _getStateFile() async {
+    final exeDir = File(Platform.resolvedExecutable).parent;
+    return File(p.join(exeDir.path, _stateFileName));
+  }
+
+  Future<void> _loadDedupeState() async {
+    final f = await _getStateFile();
+    _statePath = f.path;
+    final cfg = _config;
+    final maxEntries = cfg?.dedupeRecentTurns ?? 120;
+    _dedupe = await _DedupeState.load(f, maxEntries: maxEntries);
   }
 }
 
@@ -1078,4 +1192,142 @@ class _SpeechBubble extends StatelessWidget {
       ),
     );
   }
+}
+
+class _DedupeEntry {
+  final String ts;
+  final String textHash; // "sha256:..."
+  final String simhashHex; // "0x...."
+  final String? debugLineId;
+  final String hint;
+
+  _DedupeEntry({
+    required this.ts,
+    required this.textHash,
+    required this.simhashHex,
+    required this.debugLineId,
+    required this.hint,
+  });
+
+  Map<String, dynamic> toJson() => {
+    "ts": ts,
+    "text_hash": textHash,
+    "simhash": simhashHex,
+    "debug_line_id": debugLineId,
+    "hint": hint,
+  };
+
+  static _DedupeEntry? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    return _DedupeEntry(
+      ts: (j["ts"] ?? "").toString(),
+      textHash: (j["text_hash"] ?? "").toString(),
+      simhashHex: (j["simhash"] ?? "").toString(),
+      debugLineId: (j["debug_line_id"] as String?),
+      hint: (j["hint"] ?? "").toString(),
+    );
+  }
+}
+
+class _DedupeState {
+  final List<_DedupeEntry> recent;
+  _DedupeState(this.recent);
+
+  static const int _v = 1;
+
+  static Future<_DedupeState> load(File f, {required int maxEntries}) async {
+    if (!f.existsSync()) return _DedupeState([]);
+    try {
+      final obj = jsonDecode(await f.readAsString());
+      if (obj is! Map<String, dynamic>) return _DedupeState([]);
+      final arr = obj["recent"];
+      if (arr is! List) return _DedupeState([]);
+      final entries = arr.map(_DedupeEntry.fromJson).whereType<_DedupeEntry>().toList();
+      if (entries.length > maxEntries) {
+        return _DedupeState(entries.sublist(entries.length - maxEntries));
+      }
+      return _DedupeState(entries);
+    } catch (_) {
+      return _DedupeState([]);
+    }
+  }
+
+  Future<void> save(File f, {required int maxEntries}) async {
+    final trimmed = recent.length > maxEntries
+        ? recent.sublist(recent.length - maxEntries)
+        : recent;
+    final obj = {
+      "v": _v,
+      "recent": trimmed.map((e) => e.toJson()).toList(),
+    };
+    await f.writeAsString(const JsonEncoder.withIndent("  ").convert(obj));
+  }
+
+  List<String> buildHints({required int maxHints}) {
+    final t = recent.length > maxHints ? recent.sublist(recent.length - maxHints) : recent;
+    return t.map((e) => e.hint).toList();
+  }
+}
+
+// ====== fingerprint helpers ======
+
+final RegExp _reStrip = RegExp(r'[\s\p{P}\p{S}]', unicode: true);
+String _norm(String s) => s.toLowerCase().replaceAll(_reStrip, '');
+
+String _hintOf(String text, {int max = 32}) {
+  final t = text.trim().replaceAll('\n', ' ');
+  if (t.length <= max) return t;
+  return "${t.substring(0, max)}…";
+}
+
+int _fnv1a64(String s) {
+  const int offset = 0xcbf29ce484222325;
+  const int prime = 0x100000001b3;
+  const int mask = 0xFFFFFFFFFFFFFFFF;
+
+  int h = offset;
+  final bytes = utf8.encode(s);
+  for (final b in bytes) {
+    h ^= b;
+    h = (h * prime) & mask;
+  }
+  return h & mask;
+}
+
+int _simhash64(String text) {
+  const int mask = 0xFFFFFFFFFFFFFFFF;
+  final n = _norm(text);
+  if (n.length < 3) return _fnv1a64(n);
+
+  final acc = List<int>.filled(64, 0);
+  for (int i = 0; i <= n.length - 3; i++) {
+    final tri = n.substring(i, i + 3);
+    final h = _fnv1a64(tri);
+    for (int b = 0; b < 64; b++) {
+      acc[b] += ((h >> b) & 1) == 1 ? 1 : -1;
+    }
+  }
+
+  int out = 0;
+  for (int b = 0; b < 64; b++) {
+    if (acc[b] > 0) out |= (1 << b);
+  }
+  return out & mask;
+}
+
+int _popcount64(int x) {
+  int c = 0;
+  while (x != 0) {
+    x &= (x - 1);
+    c++;
+  }
+  return c;
+}
+
+int _hamming64(int a, int b) => _popcount64((a ^ b) & 0xFFFFFFFFFFFFFFFF);
+
+String _hex64(int x) => "0x${x.toRadixString(16).padLeft(16, '0')}";
+int _parseHex64(String s) {
+  final t = s.startsWith("0x") ? s.substring(2) : s;
+  return int.tryParse(t, radix: 16) ?? 0;
 }
