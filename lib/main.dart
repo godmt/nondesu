@@ -9,10 +9,10 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_acrylic/flutter_acrylic.dart';
 import 'package:http/http.dart' as http;
+import 'package:webfeed/webfeed.dart' as wf;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:xml/xml.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1189,82 +1189,89 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   bool _rssHasItemId(String itemId) => _rssCache.items.any((e) => e.itemId == itemId);
 
-  List<RssItem> _parseFeedXml({
-    required String feedId,
-    required String xmlText,
-  }) {
-    final doc = XmlDocument.parse(xmlText);
-    final root = doc.rootElement;
+  List<RssItem> _parseFeedXml({required String feedId, required String xmlText}) {
+    // NOTE: We keep the name for minimal diff, but this is no longer "xml.dart".
+    // webfeed supports RSS (0.9/1.0/2.0) and Atom.
+    String _bestAtomLink(List<wf.AtomLink>? links) {
+      if (links == null || links.isEmpty) return '';
+      // Prefer rel="alternate" (or empty rel), otherwise fall back to first href.
+      for (final l in links) {
+        final href = (l.href ?? '').trim();
+        if (href.isEmpty) continue;
+        final rel = (l.rel ?? '').trim();
+        if (rel.isEmpty || rel == 'alternate') return href;
+      }
+      for (final l in links) {
+        final href = (l.href ?? '').trim();
+        if (href.isNotEmpty) return href;
+      }
+      return '';
+    }
 
-    // Atom
-    if (root.name.local == "feed") {
+    // Try RSS first.
+    try {
+      final feed = wf.RssFeed.parse(xmlText);
+      final items = feed.items ?? const <wf.RssItem>[];
       final out = <RssItem>[];
-      for (final entry in _elementsByLocal(root, "entry")) {
-        final title = _stripTags(_firstElementByLocal(entry, "title")?.innerText ?? "");
-        final id = (_firstElementByLocal(entry, "id")?.innerText ?? "").trim();
+      for (final it in items) {
+        final title = _stripTags(it.title ?? '').trim();
+        final link = (it.link ?? '').trim();
+        final guid = (it.guid ?? '').trim();
 
-        String link = "";
-        for (final l in _elementsByLocal(entry, "link")) {
-          final rel = (l.getAttribute("rel") ?? "").trim();
-          final href = (l.getAttribute("href") ?? "").trim();
-          if (href.isEmpty) continue;
-          if (rel.isEmpty || rel == "alternate") {
-            link = href;
-            break;
-          }
-        }
+        final dc = it.dc;
+        final publishedAt =
+            (it.pubDate ?? dc?.date ?? dc?.created ?? dc?.modified)?.toLocal()
+            // どうしても日付が取れないフィード用の保険（取れないせいでcapで全落ちするのを防ぐ）
+            ?? DateTime.now();
 
-        final updated = _parseRssDate(_firstElementByLocal(entry, "updated")?.innerText);
-        final published = _parseRssDate(_firstElementByLocal(entry, "published")?.innerText);
-        final summary = _stripTags(_firstElementByLocal(entry, "summary")?.innerText ?? _firstElementByLocal(entry, "content")?.innerText ?? "");
+        // Prefer description, then content:encoded.
+        final summaryRaw = (it.description ?? it.content?.value ?? '');
+        final summary = _stripTags(summaryRaw).trim();
 
-        final itemId = (id.isNotEmpty ? id : (link.isNotEmpty ? link : "$feedId:${sha256.convert(utf8.encode(title)).toString()}"));
+        final stableKey = (guid.isNotEmpty ? guid : (link.isNotEmpty ? link : title)).trim();
+        if (stableKey.isEmpty) continue;
+
+        final itemId = '$feedId:${sha256.convert(utf8.encode(stableKey)).toString()}';
+
         out.add(RssItem(
           feedId: feedId,
           itemId: itemId,
-          title: title,
+          title: title.isEmpty ? '(no title)' : title,
           link: link,
-          publishedAt: (published ?? updated),
+          publishedAt: publishedAt,
           summary: summary,
         ));
       }
       return out;
+    } catch (_) {
+      // fallthrough
     }
 
-    // RSS
-    final channel = doc.findAllElements("channel").cast<XmlElement?>().firstWhere((e) => e != null, orElse: () => null);
-    final items = (channel != null)
-        ? channel.findElements("item")
-        : doc.findAllElements("item"); // fallback
-
+    // Atom.
+    final atom = wf.AtomFeed.parse(xmlText);
+    final items = atom.items ?? const <wf.AtomItem>[];
     final out = <RssItem>[];
-    for (final item in items) {
-      final title = _stripTags(item.getElement("title")?.innerText ?? "");
-      final link = (item.getElement("link")?.innerText ?? "").trim();
-      final guid = (item.getElement("guid")?.innerText ?? "").trim();
-      final pub = _parseRssDate(item.getElement("pubDate")?.innerText);
+    for (final it in items) {
+      final title = _stripTags(it.title ?? '').trim();
+      final link = _bestAtomLink(it.links);
+      final id = (it.id ?? '').trim();
 
-      // description / content:encoded
-      String desc = item.getElement("description")?.innerText ?? "";
-      if (desc.isEmpty) {
-        // try any "*:encoded"
-        for (final c in item.childElements) {
-          if (c.name.local == "encoded") {
-            desc = c.innerText;
-            break;
-          }
-        }
-      }
+      final publishedAt = (it.updated?.toLocal()) ?? _parseRssDate(it.published);
 
-      final summary = _stripTags(desc);
-      final itemId = (guid.isNotEmpty ? guid : (link.isNotEmpty ? link : "$feedId:${sha256.convert(utf8.encode(title)).toString()}"));
+      final summaryRaw = (it.summary ?? it.content ?? '');
+      final summary = _stripTags(summaryRaw).trim();
+
+      final stableKey = (id.isNotEmpty ? id : (link.isNotEmpty ? link : title)).trim();
+      if (stableKey.isEmpty) continue;
+
+      final itemId = '$feedId:${sha256.convert(utf8.encode(stableKey)).toString()}';
 
       out.add(RssItem(
         feedId: feedId,
         itemId: itemId,
-        title: title,
+        title: title.isEmpty ? '(no title)' : title,
         link: link,
-        publishedAt: pub,
+        publishedAt: publishedAt,
         summary: summary,
       ));
     }
@@ -1284,40 +1291,114 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return;
     }
 
-    await _logEvent("rss", {"status": "fetch_start", "feeds": feeds.map((e) => {"id": e.id, "url": e.url}).toList()});
+    await _logEvent("rss", {
+      "status": "fetch_start",
+      "feeds": feeds.map((e) => {"id": e.id, "url": e.url}).toList(),
+      "max_cache_items": s.maxCacheItems,
+    });
+
+    String _decodeBodyBytes(List<int> bytes) {
+      // Most feeds are UTF-8. If it isn't, we still try to keep XML structure parseable.
+      try {
+        return utf8.decode(bytes, allowMalformed: true);
+      } catch (_) {
+        return latin1.decode(bytes);
+      }
+    }
 
     int added = 0;
+    final cap = s.maxCacheItems.clamp(10, 9999);
+    final perFeedTake = max(8, min(40, (cap / max(1, feeds.length)).ceil() + 4));
+
     for (final f in feeds) {
       try {
-        final resp = await http.get(Uri.parse(f.url)).timeout(const Duration(seconds: 12));
+        final resp = await http
+            .get(
+              Uri.parse(f.url),
+              headers: {
+                "User-Agent": "nondesu/0.1 (+https://github.com/godmt/nondesu)",
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+              },
+            )
+            .timeout(const Duration(seconds: 12));
+
         if (resp.statusCode != 200) {
-          await _logEvent("rss_error", {"feed": f.id, "code": resp.statusCode, "body": _trimForLog(resp.body)});
+          await _logEvent("rss_error", {
+            "feed": f.id,
+            "url": f.url,
+            "code": resp.statusCode,
+            "content_type": resp.headers["content-type"],
+            "body": _trimForLog(resp.body),
+          });
           continue;
         }
 
-        final items = _parseFeedXml(feedId: f.id, xmlText: resp.body);
-        for (final it in items) {
+        final xmlText = _decodeBodyBytes(resp.bodyBytes);
+        List<RssItem> items;
+        try {
+          items = _parseFeedXml(feedId: f.id, xmlText: xmlText);
+        } catch (e, st) {
+          await _logEvent("rss_error", {
+            "feed": f.id,
+            "url": f.url,
+            "error": "parse_failed: ${e.toString()}",
+            "stack": _trimForLog(st.toString()),
+            "content_type": resp.headers["content-type"],
+            "body_head": _trimForLog(xmlText),
+          });
+          continue;
+        }
+
+        // 最新をつまみ食い（古いログで2022年が埋まる問題を避ける）
+        items.sort((a, b) {
+          final ta = a.publishedAt?.millisecondsSinceEpoch ?? 0;
+          final tb = b.publishedAt?.millisecondsSinceEpoch ?? 0;
+          return tb.compareTo(ta); // desc
+        });
+
+        int feedAdded = 0;
+        final takeN = min(items.length, perFeedTake);
+        for (final it in items.take(takeN)) {
           if (it.title.trim().isEmpty && it.summary.trim().isEmpty) continue;
           if (_rssHasItemId(it.itemId)) continue;
           _rssCache.items.add(it);
           added++;
+          feedAdded++;
         }
+
+        await _logEvent("rss", {
+          "status": "feed_done",
+          "feed": f.id,
+          "url": f.url,
+          "parsed": items.length,
+          "take": takeN,
+          "added": feedAdded,
+        });
       } catch (e, st) {
-        await _logEvent("rss_error", {"feed": f.id, "error": e.toString(), "stack": _trimForLog(st.toString())});
+        await _logEvent("rss_error", {
+          "feed": f.id,
+          "url": f.url,
+          "error": e.toString(),
+          "stack": _trimForLog(st.toString()),
+        });
       }
     }
 
-    // cache cap
-    final cap = s.maxCacheItems;
+    // キャッシュは「最新優先」で cap に収める（古いのが残り続けるのを防ぐ）
+    _rssCache.items.sort((a, b) {
+      final ta = a.publishedAt?.millisecondsSinceEpoch ?? 0;
+      final tb = b.publishedAt?.millisecondsSinceEpoch ?? 0;
+      return tb.compareTo(ta); // desc
+    });
     if (_rssCache.items.length > cap) {
-      _rssCache.items = _rssCache.items.sublist(_rssCache.items.length - cap);
+      _rssCache.items = _rssCache.items.sublist(0, cap);
     }
 
     await _saveRssCache();
     await _logEvent("rss", {"status": "fetch_done", "added": added, "cache_size": _rssCache.items.length});
 
     setState(() => _turn = MascotTurn.fallback("RSS更新: +$added 件（キャッシュ ${_rssCache.items.length}）"));
-  }
+   }
 }
 
 class _SpeechBubble extends StatelessWidget {
@@ -1642,17 +1723,4 @@ DateTime? _parseRssDate(String? s) {
   } catch (_) {}
   // Atom updated is often ISO8601
   return DateTime.tryParse(t)?.toLocal();
-}
-
-XmlElement? _firstElementByLocal(XmlElement parent, String localName) {
-  for (final e in parent.childElements) {
-    if (e.name.local == localName) return e;
-  }
-  return null;
-}
-
-Iterable<XmlElement> _elementsByLocal(XmlElement parent, String localName) sync* {
-  for (final e in parent.childElements) {
-    if (e.name.local == localName) yield e;
-  }
 }
