@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:xml/xml.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -327,6 +328,13 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   String? _statePath;
   static const String _stateFileName = "nondesu_state.json";
 
+  // rss
+  static const String _rssSettingsFileName = "rss_feeds.json";
+  static const String _rssCacheFileName = "rss_cache.json";
+
+  RssSettings? _rssSettings;
+  RssCache _rssCache = RssCache([]);
+
   // Minimal "LLM not wired yet" talk pool
   final _localFallbackPool = const [
     "雨音って、都市のノイズをちょっとだけ丸くするよね。",
@@ -367,6 +375,14 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       // ここで return しても良いが、アバター表示だけ先に見たいなら return しない
       // return;
     }
+    // rss
+    _rssSettings = await _loadRssSettings();
+    await _loadRssCache();
+
+    if (_rssSettings?.fetchOnStart == true) {
+      await _fetchRssOnce(); // エラーはUIとログに出る設計
+    }
+    // dedupe state
     await _loadDedupeState();
     await windowManager.setSize(pack.windowSize);
     _scheduleNextIdle();
@@ -381,6 +397,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       ),
       items: const [
         PopupMenuItem<String>(
+          value: "update_rss",
+          child: Text("RSS更新"),
+        ),
+        PopupMenuItem<String>(
           value: "exit",
           child: Text("終了"),
         ),
@@ -389,6 +409,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     if (selected == "exit") {
       await windowManager.close();
+    } else if (selected == "update_rss") {
+      await _fetchRssOnce();
     }
   }
 
@@ -581,7 +603,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final sec = minSec + (span == 0 ? 0 : Random().nextInt(span + 1));
 
     _idleTimer = Timer(Duration(seconds: sec), () async {
-      await _doGeminiIdleTalk();
+      await _doGeminiIdleTalk(from: "scheduled_idle");
       _scheduleNextIdle();
     });
   }
@@ -602,7 +624,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _logEvent("turn", {"mode": "idle", "turn": t.toLogJson()});
   }
 
-  Future<void> _doGeminiIdleTalk() async {
+  Future<void> _doGeminiIdleTalk({String from = "idle"}) async {
     final pack = _pack;
     if (pack == null) return;
 
@@ -650,14 +672,14 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         setState(() => _turn = fallback);
         _startMouthFlap();
         await _recordForDedupe(fallback);
-        await _logEvent("turn", {"mode": "idle", "turn": fallback.toLogJson()});
+        await _logEvent("turn", {"mode": "idle", "from": from, "turn": fallback.toLogJson()});
         return;
       }
 
       setState(() => _turn = t);
       _startMouthFlap();
       await _recordForDedupe(t);
-      await _logEvent("turn", {"mode": "idle", "turn": t.toLogJson()});
+      await _logEvent("turn", {"mode": "idle", "from": from, "turn": t.toLogJson()});
     } catch (e, st) {
       await _logEvent("error", {
         "where": "gemini_idle",
@@ -712,7 +734,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   Future<void> _onAvatarTap() async {
     // PoC: click triggers immediate talk
-    await _doGeminiIdleTalk();
+    await _doGeminiIdleTalk(from: "avatar_tap");
   }
 
   Future<void> _onChoice(Intent intent) async {
@@ -730,7 +752,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     // For now: local followups
     if (intent == Intent.changeTopic) {
-      await _doGeminiIdleTalk();
+      await _doGeminiIdleTalk(from: "user_change_topic");
       return;
     }
     if (intent == Intent.more) {
@@ -1121,6 +1143,181 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final maxEntries = cfg?.dedupeRecentTurns ?? 120;
     _dedupe = await _DedupeState.load(f, maxEntries: maxEntries);
   }
+
+  // ===== rss functions =====
+  Future<File> _exeSiblingFile(String name) async {
+    final exeDir = File(Platform.resolvedExecutable).parent;
+    return File(p.join(exeDir.path, name));
+  }
+
+  Future<RssSettings?> _loadRssSettings() async {
+    final f = await _exeSiblingFile(_rssSettingsFileName);
+
+    if (!f.existsSync()) {
+      final tpl = RssSettings.template();
+      await f.writeAsString(const JsonEncoder.withIndent("  ").convert(tpl.toJson()));
+      await _logEvent("rss", {"status": "created_settings_template", "path": f.path});
+      return null;
+    }
+
+    try {
+      final obj = jsonDecode(await f.readAsString());
+      return RssSettings.fromJson(obj);
+    } catch (e, st) {
+      await _logEvent("error", {"where": "rss_load_settings", "error": e.toString(), "stack": st.toString()});
+      return null;
+    }
+  }
+
+  Future<void> _loadRssCache() async {
+    final f = await _exeSiblingFile(_rssCacheFileName);
+    if (!f.existsSync()) {
+      _rssCache = RssCache([]);
+      return;
+    }
+    try {
+      _rssCache = RssCache.fromJson(jsonDecode(await f.readAsString()));
+    } catch (_) {
+      _rssCache = RssCache([]);
+    }
+  }
+
+  Future<void> _saveRssCache() async {
+    final f = await _exeSiblingFile(_rssCacheFileName);
+    await f.writeAsString(const JsonEncoder.withIndent("  ").convert(_rssCache.toJson()));
+  }
+
+  bool _rssHasItemId(String itemId) => _rssCache.items.any((e) => e.itemId == itemId);
+
+  List<RssItem> _parseFeedXml({
+    required String feedId,
+    required String xmlText,
+  }) {
+    final doc = XmlDocument.parse(xmlText);
+    final root = doc.rootElement;
+
+    // Atom
+    if (root.name.local == "feed") {
+      final out = <RssItem>[];
+      for (final entry in _elementsByLocal(root, "entry")) {
+        final title = _stripTags(_firstElementByLocal(entry, "title")?.innerText ?? "");
+        final id = (_firstElementByLocal(entry, "id")?.innerText ?? "").trim();
+
+        String link = "";
+        for (final l in _elementsByLocal(entry, "link")) {
+          final rel = (l.getAttribute("rel") ?? "").trim();
+          final href = (l.getAttribute("href") ?? "").trim();
+          if (href.isEmpty) continue;
+          if (rel.isEmpty || rel == "alternate") {
+            link = href;
+            break;
+          }
+        }
+
+        final updated = _parseRssDate(_firstElementByLocal(entry, "updated")?.innerText);
+        final published = _parseRssDate(_firstElementByLocal(entry, "published")?.innerText);
+        final summary = _stripTags(_firstElementByLocal(entry, "summary")?.innerText ?? _firstElementByLocal(entry, "content")?.innerText ?? "");
+
+        final itemId = (id.isNotEmpty ? id : (link.isNotEmpty ? link : "$feedId:${sha256.convert(utf8.encode(title)).toString()}"));
+        out.add(RssItem(
+          feedId: feedId,
+          itemId: itemId,
+          title: title,
+          link: link,
+          publishedAt: (published ?? updated),
+          summary: summary,
+        ));
+      }
+      return out;
+    }
+
+    // RSS
+    final channel = doc.findAllElements("channel").cast<XmlElement?>().firstWhere((e) => e != null, orElse: () => null);
+    final items = (channel != null)
+        ? channel.findElements("item")
+        : doc.findAllElements("item"); // fallback
+
+    final out = <RssItem>[];
+    for (final item in items) {
+      final title = _stripTags(item.getElement("title")?.innerText ?? "");
+      final link = (item.getElement("link")?.innerText ?? "").trim();
+      final guid = (item.getElement("guid")?.innerText ?? "").trim();
+      final pub = _parseRssDate(item.getElement("pubDate")?.innerText);
+
+      // description / content:encoded
+      String desc = item.getElement("description")?.innerText ?? "";
+      if (desc.isEmpty) {
+        // try any "*:encoded"
+        for (final c in item.childElements) {
+          if (c.name.local == "encoded") {
+            desc = c.innerText;
+            break;
+          }
+        }
+      }
+
+      final summary = _stripTags(desc);
+      final itemId = (guid.isNotEmpty ? guid : (link.isNotEmpty ? link : "$feedId:${sha256.convert(utf8.encode(title)).toString()}"));
+
+      out.add(RssItem(
+        feedId: feedId,
+        itemId: itemId,
+        title: title,
+        link: link,
+        publishedAt: pub,
+        summary: summary,
+      ));
+    }
+    return out;
+  }
+
+  Future<void> _fetchRssOnce() async {
+    final s = _rssSettings;
+    if (s == null) {
+      setState(() => _turn = MascotTurn.fallback("rss_feeds.json が未設定。exe隣に作ったテンプレを編集して。"));
+      return;
+    }
+
+    final feeds = s.feeds.where((f) => f.enabled && f.id.isNotEmpty && f.url.isNotEmpty).toList();
+    if (feeds.isEmpty) {
+      setState(() => _turn = MascotTurn.fallback("RSS: 有効なfeedが無い。rss_feeds.json を確認して。"));
+      return;
+    }
+
+    await _logEvent("rss", {"status": "fetch_start", "feeds": feeds.map((e) => {"id": e.id, "url": e.url}).toList()});
+
+    int added = 0;
+    for (final f in feeds) {
+      try {
+        final resp = await http.get(Uri.parse(f.url)).timeout(const Duration(seconds: 12));
+        if (resp.statusCode != 200) {
+          await _logEvent("rss_error", {"feed": f.id, "code": resp.statusCode, "body": _trimForLog(resp.body)});
+          continue;
+        }
+
+        final items = _parseFeedXml(feedId: f.id, xmlText: resp.body);
+        for (final it in items) {
+          if (it.title.trim().isEmpty && it.summary.trim().isEmpty) continue;
+          if (_rssHasItemId(it.itemId)) continue;
+          _rssCache.items.add(it);
+          added++;
+        }
+      } catch (e, st) {
+        await _logEvent("rss_error", {"feed": f.id, "error": e.toString(), "stack": _trimForLog(st.toString())});
+      }
+    }
+
+    // cache cap
+    final cap = s.maxCacheItems;
+    if (_rssCache.items.length > cap) {
+      _rssCache.items = _rssCache.items.sublist(_rssCache.items.length - cap);
+    }
+
+    await _saveRssCache();
+    await _logEvent("rss", {"status": "fetch_done", "added": added, "cache_size": _rssCache.items.length});
+
+    setState(() => _turn = MascotTurn.fallback("RSS更新: +$added 件（キャッシュ ${_rssCache.items.length}）"));
+  }
 }
 
 class _SpeechBubble extends StatelessWidget {
@@ -1330,4 +1527,132 @@ String _hex64(int x) => "0x${x.toRadixString(16).padLeft(16, '0')}";
 int _parseHex64(String s) {
   final t = s.startsWith("0x") ? s.substring(2) : s;
   return int.tryParse(t, radix: 16) ?? 0;
+}
+
+// ====== RSS feed helper =====
+
+class RssFeed {
+  final String id;
+  final String url;
+  final bool enabled;
+  RssFeed({required this.id, required this.url, required this.enabled});
+
+  static RssFeed? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    return RssFeed(
+      id: (j["id"] ?? "").toString().trim(),
+      url: (j["url"] ?? "").toString().trim(),
+      enabled: (j["enabled"] is bool) ? (j["enabled"] as bool) : true,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {"id": id, "url": url, "enabled": enabled};
+}
+
+class RssSettings {
+  final List<RssFeed> feeds;
+  final bool fetchOnStart;
+  final int maxCacheItems;
+  RssSettings({required this.feeds, required this.fetchOnStart, required this.maxCacheItems});
+
+  static RssSettings template() => RssSettings(
+        feeds: [RssFeed(id: "ai", url: "https://example.com/feed.xml", enabled: true)],
+        fetchOnStart: true,
+        maxCacheItems: 80,
+      );
+
+  Map<String, dynamic> toJson() => {
+        "feeds": feeds.map((f) => f.toJson()).toList(),
+        "fetch_on_start": fetchOnStart,
+        "max_cache_items": maxCacheItems,
+      };
+
+  static RssSettings? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    final feedsAny = j["feeds"];
+    final feeds = (feedsAny is List) ? feedsAny.map(RssFeed.fromJson).whereType<RssFeed>().toList() : <RssFeed>[];
+    final fetch = (j["fetch_on_start"] is bool) ? (j["fetch_on_start"] as bool) : true;
+    final maxItems = (j["max_cache_items"] is num) ? (j["max_cache_items"] as num).toInt() : 80;
+    return RssSettings(feeds: feeds, fetchOnStart: fetch, maxCacheItems: maxItems.clamp(10, 500));
+  }
+}
+
+class RssItem {
+  final String feedId;
+  final String itemId; // stable id (guid/link/id)
+  final String title;
+  final String link;
+  final DateTime? publishedAt;
+  final String summary;
+  RssItem({
+    required this.feedId,
+    required this.itemId,
+    required this.title,
+    required this.link,
+    required this.publishedAt,
+    required this.summary,
+  });
+
+  Map<String, dynamic> toJson() => {
+        "feed_id": feedId,
+        "item_id": itemId,
+        "title": title,
+        "link": link,
+        "published_at": publishedAt?.toIso8601String(),
+        "summary": summary,
+      };
+
+  static RssItem? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    return RssItem(
+      feedId: (j["feed_id"] ?? "").toString(),
+      itemId: (j["item_id"] ?? "").toString(),
+      title: (j["title"] ?? "").toString(),
+      link: (j["link"] ?? "").toString(),
+      publishedAt: (j["published_at"] is String) ? DateTime.tryParse(j["published_at"]) : null,
+      summary: (j["summary"] ?? "").toString(),
+    );
+  }
+}
+
+class RssCache {
+  List<RssItem> items; // newest lastでもOK。ここは簡単に。
+  RssCache(this.items);
+
+  Map<String, dynamic> toJson() => {"items": items.map((e) => e.toJson()).toList()};
+
+  static RssCache fromJson(dynamic j) {
+    if (j is! Map) return RssCache([]);
+    final a = j["items"];
+    if (a is! List) return RssCache([]);
+    return RssCache(a.map(RssItem.fromJson).whereType<RssItem>().toList());
+  }
+}
+
+// ----- helpers -----
+
+String _stripTags(String s) => s.replaceAll(RegExp(r"<[^>]*>"), " ").replaceAll(RegExp(r"\s+"), " ").trim();
+
+DateTime? _parseRssDate(String? s) {
+  if (s == null) return null;
+  final t = s.trim();
+  // RSS pubDate often RFC822. HttpDate.parse handles many common formats.
+  try {
+    return HttpDate.parse(t).toLocal();
+  } catch (_) {}
+  // Atom updated is often ISO8601
+  return DateTime.tryParse(t)?.toLocal();
+}
+
+XmlElement? _firstElementByLocal(XmlElement parent, String localName) {
+  for (final e in parent.childElements) {
+    if (e.name.local == localName) return e;
+  }
+  return null;
+}
+
+Iterable<XmlElement> _elementsByLocal(XmlElement parent, String localName) sync* {
+  for (final e in parent.childElements) {
+    if (e.name.local == localName) yield e;
+  }
 }
