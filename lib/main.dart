@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
@@ -14,6 +16,9 @@ import 'package:window_manager/window_manager.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // acrylic init first
+  await Window.initialize();
+
   // Window init
   await windowManager.ensureInitialized();
   const windowOptions = WindowOptions(
@@ -21,21 +26,24 @@ void main() async {
     center: true,
     backgroundColor: Colors.transparent,
     skipTaskbar: false,
-    titleBarStyle: TitleBarStyle.hidden,
     alwaysOnTop: true,
   );
   await windowManager.waitUntilReadyToShow(windowOptions, () async {
+    // フレーム/影を消す
+    await windowManager.setAsFrameless();      // outline border等を除去
+    await windowManager.setHasShadow(false);   // Windowsではframeless時にだけ効く
+
+    await Window.setWindowBackgroundColorToClear();
+    await Window.makeTitlebarTransparent();
+    await Window.addEmptyMaskImage();
+    await Window.disableShadow();
+
+    // 影は念のためこちらも（flutter_acrylic側）
+    try { Window.disableShadow(); } catch (_) {}
+
     await windowManager.show();
     await windowManager.focus();
   });
-
-  // Acrylic (transparent)
-  try {
-    await Window.initialize();
-    await Window.setEffect(effect: WindowEffect.transparent);
-  } catch (_) {
-    // 환경에 따라 실패할 수 있음. 실패해도 계속 진행.
-  }
 
   runApp(const MascotApp());
 }
@@ -55,6 +63,18 @@ class MascotApp extends StatelessWidget {
       ),
     );
   }
+}
+
+class AppConfig {
+  final String geminiApiKey;
+  final int idleTalkMinSec;
+  final int idleTalkMaxSec;
+
+  AppConfig({
+    required this.geminiApiKey,
+    required this.idleTalkMinSec,
+    required this.idleTalkMaxSec,
+  });
 }
 
 // ===== Models =====
@@ -227,6 +247,52 @@ class SpritePair {
   SpritePair({required this.closedPath, required this.openPath});
 }
 
+// Mask for hit testing
+class _RgbaMask {
+  final int w;
+  final int h;
+  final Uint8List rgba; // rawRgba
+  _RgbaMask(this.w, this.h, this.rgba);
+}
+
+Future<_RgbaMask?> _loadRgbaMask(String path) async {
+  try {
+    final bytes = await File(path).readAsBytes();
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final img = frame.image;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null) return null;
+    return _RgbaMask(img.width, img.height, bd.buffer.asUint8List());
+  } catch (_) {
+    return null;
+  }
+}
+
+bool _isOpaqueAtContainFit({
+  required Offset local,
+  required Size widgetSize,
+  required _RgbaMask mask,
+  int alphaThreshold = 16,
+}) {
+  final scale = min(widgetSize.width / mask.w, widgetSize.height / mask.h);
+  final dispW = mask.w * scale;
+  final dispH = mask.h * scale;
+  final offX = (widgetSize.width - dispW) / 2.0;
+  final offY = (widgetSize.height - dispH) / 2.0;
+
+  final x = local.dx - offX;
+  final y = local.dy - offY;
+  if (x < 0 || y < 0 || x >= dispW || y >= dispH) return false;
+
+  final px = (x / scale).floor().clamp(0, mask.w - 1);
+  final py = (y / scale).floor().clamp(0, mask.h - 1);
+
+  final idx = (py * mask.w + px) * 4 + 3; // alpha
+  final a = mask.rgba[idx];
+  return a > alphaThreshold;
+}
+
 // ===== Home =====
 
 class MascotHome extends StatefulWidget {
@@ -238,6 +304,9 @@ class MascotHome extends StatefulWidget {
 
 class _MascotHomeState extends State<MascotHome> with WindowListener {
   MascotPack? _pack;
+  AppConfig? _config;
+  String? _configPath;
+  final Map<String, _RgbaMask> _maskCache = {};
 
   // State
   MascotTurn? _turn;
@@ -279,9 +348,58 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return;
     }
     _pack = pack;
+    _config = await _loadConfig();
+    if (_config == null) {
+      setState(() {
+        _turn = MascotTurn.fallback("設定ファイルが未設定。\n$_configFileName を編集して再起動して。");
+      });
+      // ここで return しても良いが、アバター表示だけ先に見たいなら return しない
+      // return;
+    }
     await windowManager.setSize(pack.windowSize);
     _scheduleNextIdle();
     setState(() {});
+  }
+
+  Future<void> _showContextMenu(Offset globalPos) async {
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        globalPos.dx, globalPos.dy, globalPos.dx, globalPos.dy,
+      ),
+      items: const [
+        PopupMenuItem<String>(
+          value: "exit",
+          child: Text("終了"),
+        ),
+      ],
+    );
+
+    if (selected == "exit") {
+      await windowManager.close();
+    }
+  }
+
+  Future<void> _maybeStartDrag(Offset localPos) async {
+    final pack = _pack;
+    final turn = _turn;
+    if (pack == null) return;
+
+    final emotion = turn?.emotion ?? pack.defaultEmotion;
+    final sprite = pack.sprites[emotion];
+    final maskPath = sprite?.closedPath; // 口パクしても判定は閉じ画像で十分実用
+    if (maskPath == null) return;
+
+    _maskCache[maskPath] ??= (await _loadRgbaMask(maskPath)) ?? _maskCache[maskPath]!;
+    final mask = _maskCache[maskPath];
+    if (mask == null) return;
+
+    final winSize = MediaQuery.sizeOf(context);
+    final ok = _isOpaqueAtContainFit(local: localPos, widgetSize: winSize, mask: mask);
+
+    if (ok) {
+      await windowManager.startDragging(); // :contentReference[oaicite:8]{index=8}
+    }
   }
 
   Future<MascotPack?> _loadFirstMascotPack() async {
@@ -355,6 +473,80 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     return appSupport;
   }
 
+  static const String _configFileName = "nondesu_config.json";
+
+  Future<File> _getConfigFile() async {
+    // exe と同じフォルダを優先（avatars の有無には依存しない）
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      return File(p.join(exeDir.path, _configFileName));
+    } catch (_) {
+      final appSupport = await getApplicationSupportDirectory();
+      return File(p.join(appSupport.path, _configFileName));
+    }
+  }
+
+  String _trimForLog(String s, {int max = 4000}) {
+    if (s.length <= max) return s;
+    return "${s.substring(0, max)}…(truncated)";
+  }
+
+  Future<AppConfig?> _loadConfig() async {
+    final f = await _getConfigFile();
+    _configPath = f.path;
+
+    if (!f.existsSync()) {
+      // 無ければテンプレを作って、ユーザーに編集してもらう
+      final template = {
+        "gemini_api_key": "PASTE_YOUR_KEY_HERE",
+        "idle_talk_min_sec": 30,
+        "idle_talk_max_sec": 90
+      };
+      await f.writeAsString(const JsonEncoder.withIndent("  ").convert(template));
+      await _logEvent("config", {"status": "created_template", "path": f.path});
+      return null;
+    }
+
+    try {
+      final raw = await f.readAsString();
+      final obj = jsonDecode(raw);
+      if (obj is! Map<String, dynamic>) return null;
+
+      final key = (obj["gemini_api_key"] ?? "").toString().trim();
+      if (key.isEmpty || key == "PASTE_YOUR_KEY_HERE") return null;
+
+      // idle interval
+      int readInt(String k, int def) {
+        final v = obj[k];
+        if (v is int) return v;
+        if (v is num) return v.toInt();
+        if (v is String) return int.tryParse(v.trim()) ?? def;
+        return def;
+      }
+
+      final minSec = readInt("idle_talk_min_sec", 30);
+      final maxSec = readInt("idle_talk_max_sec", 90);
+
+      // clamp & sanitize (シンプル安全柵)
+      final safeMin = minSec.clamp(3, 24 * 60 * 60);
+      final safeMax = maxSec.clamp(safeMin, 24 * 60 * 60);
+
+      return AppConfig(
+        geminiApiKey: key,
+        idleTalkMinSec: safeMin,
+        idleTalkMaxSec: safeMax,
+      );
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": "load_config",
+        "error": _trimForLog(e.toString()),
+        "stack": _trimForLog(st.toString()),
+        "path": f.path,
+      });
+      return null;
+    }
+  }
+
   void _scheduleNextIdle() {
     _idleTimer?.cancel();
 
@@ -367,7 +559,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     if (_quiet) return;
 
     // Ukagaka-ish: random interval 30~90 seconds for PoC
-    final sec = 30 + Random().nextInt(61);
+    final cfg = _config;
+    final minSec = cfg?.idleTalkMinSec ?? 30;
+    final maxSec = cfg?.idleTalkMaxSec ?? 90;
+    final span = max(0, maxSec - minSec);
+    final sec = minSec + (span == 0 ? 0 : Random().nextInt(span + 1));
+
     _idleTimer = Timer(Duration(seconds: sec), () async {
       await _doGeminiIdleTalk();
       _scheduleNextIdle();
@@ -394,16 +591,22 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final pack = _pack;
     if (pack == null) return;
 
-    final apiKey = _apiKeyFromEnv();
-    if (apiKey == null || apiKey.trim().isEmpty) {
-      setState(() => _turn = MascotTurn.fallback("GEMINI_API_KEY が無い。環境変数に入れてね。"));
+    final cfg = _config;
+    if (cfg == null) {
+      setState(() => _turn = MascotTurn.fallback(
+          "APIキー未設定。\n$_configFileName を exe と同じフォルダに置いて、gemini_api_key を書いて再起動して。\n($_configPath)"));
+      await _logEvent("error", {
+        "where": "gemini_idle",
+        "error": "missing_config_or_key",
+        "config_path": _configPath,
+      });
       return;
     }
 
     try {
       final userPrompt = _buildUserPrompt(mode: "idle", maxChars: 70);
       final t = await _callGeminiTurn(
-        apiKey: apiKey,
+        apiKey: cfg.geminiApiKey,
         model: "gemini-3-flash-preview",
         systemPrompt: pack.systemPrompt,
         userPrompt: userPrompt,
@@ -412,8 +615,13 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       setState(() => _turn = t);
       _startMouthFlap();
       await _logEvent("turn", {"mode": "idle", "turn": t.toLogJson()});
-    } catch (e) {
-      setState(() => _turn = MascotTurn.fallback("…通信が荒れてる。${e.toString()}"));
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": "gemini_idle",
+        "error": _trimForLog(e.toString()),
+        "stack": _trimForLog(st.toString()),
+      });
+      setState(() => _turn = MascotTurn.fallback("…エラー。${e.toString()}"));
     }
   }
 
@@ -531,9 +739,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   Future<void> _logEvent(String type, Map<String, dynamic> data) async {
     try {
-      final dir = await getApplicationSupportDirectory();
-      final logsDir = Directory(p.join(dir.path, "logs"));
-      if (!logsDir.existsSync()) logsDir.createSync(recursive: true);
+      final logsDir = await _getLogsDir();
 
       final day = DateTime.now();
       final fn = "${day.year.toString().padLeft(4, '0')}"
@@ -550,9 +756,26 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         "mascot": _pack?.id,
         "data": data,
       };
+
       await f.writeAsString("${jsonEncode(payload)}\n", mode: FileMode.append, flush: false);
     } catch (_) {
-      // ignore
+      // ログが書けない状況では諦める（UIは別途エラー表示する方針なのでOK）
+    }
+  }
+
+  Future<Directory> _getLogsDir() async {
+    // まず exe と同じフォルダ配下 logs/ を優先
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      final d = Directory(p.join(exeDir.path, "logs"));
+      if (!d.existsSync()) d.createSync(recursive: true);
+      return d;
+    } catch (_) {
+      // 置き場所が Program Files 等で書けない場合の保険
+      final appSupport = await getApplicationSupportDirectory();
+      final d = Directory(p.join(appSupport.path, "logs"));
+      if (!d.existsSync()) d.createSync(recursive: true);
+      return d;
     }
   }
 
@@ -575,7 +798,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           // Avatar
           Positioned.fill(
             child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
               onTap: _onAvatarTap,
+              onSecondaryTapDown: (d) => _showContextMenu(d.globalPosition),
+              onPanStart: (d) => _maybeStartDrag(d.localPosition),
               child: imgPath == null
                   ? const Center(child: Text("Loading...", style: TextStyle(color: Colors.white)))
                   : Image.file(File(imgPath), fit: BoxFit.contain),
@@ -596,27 +822,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
                 ),
               ),
             ),
-
-          // Right click menu-like small button (PoC)
-          Positioned(
-            top: 8,
-            right: 8,
-            child: IconButton(
-              tooltip: "閉じる",
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => windowManager.close(),
-            ),
-          ),
         ],
       ),
     );
   }
 
-  // === Gemini settings (super simple) ===
-  // PoCなので「まずは環境変数」対応にします。
-  // set GEMINI_API_KEY=... をWindowsで設定してから起動、が一番手軽。
-  // もちろん後で入力UIにしてもOK。
-  String? _apiKeyFromEnv() => Platform.environment["GEMINI_API_KEY"];
+  // === Gemini settings ===
 
   Map<String, dynamic> _mascotTurnSchema() {
     // response_schema は curl例のように大文字Typeを使う形式で合わせます。:contentReference[oaicite:3]{index=3}
@@ -691,9 +902,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       ],
       "generationConfig": {
         "response_mime_type": "application/json",
-        "response_schema": _mascotTurnSchema(),
+        "responseJsonSchema": _mascotTurnSchema(),
         "temperature": 1.0,
-        "maxOutputTokens": 256
+        "thinkingConfig": {
+          "thinkingLevel": "low"
+        },
+        "maxOutputTokens": 2048
       }
     };
 
@@ -707,15 +921,49 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       throw Exception("Gemini HTTP ${resp.statusCode}: ${resp.body}");
     }
 
-    final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
-    final candidates = (decoded["candidates"] as List?) ?? [];
-    if (candidates.isEmpty) throw Exception("No candidates");
-    final content = (candidates[0] as Map<String, dynamic>)["content"] as Map<String, dynamic>;
-    final parts = (content["parts"] as List).cast<Map<String, dynamic>>();
-    final text = (parts.first["text"] as String?) ?? "";
+    final decoded = jsonDecode(resp.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception("Gemini: response is not a JSON object");
+    }
 
-    // response_mime_type=application/json でも text にJSON文字列で入る前提でパースします。
-    final obj = jsonDecode(text) as Map<String, dynamic>;
+    final candidatesAny = decoded["candidates"];
+    if (candidatesAny is! List || candidatesAny.isEmpty) {
+      final pf = decoded["promptFeedback"];
+      throw Exception("Gemini: no candidates. promptFeedback=${jsonEncode(pf)}");
+    }
+
+    final cand0Any = candidatesAny.first;
+    if (cand0Any is! Map<String, dynamic>) {
+      throw Exception("Gemini: bad candidate shape");
+    }
+    final finishReason = cand0Any["finishReason"]?.toString();
+
+    final contentAny = cand0Any["content"];
+    if (contentAny is! Map<String, dynamic>) {
+      throw Exception("Gemini: no content. finishReason=$finishReason");
+    }
+
+    final partsAny = contentAny["parts"];
+    if (partsAny is! List || partsAny.isEmpty) {
+      throw Exception("Gemini: no parts. finishReason=$finishReason");
+    }
+
+    // parts が複数ある可能性もあるので text を連結
+    final text = partsAny
+        .whereType<Map>()
+        .map((p) => p["text"])
+        .whereType<String>()
+        .join("");
+
+    if (text.trim().isEmpty) {
+      throw Exception("Gemini: empty text. finishReason=$finishReason");
+    }
+
+    // response_mime_type=application/json なので text は JSON 文字列想定
+    final obj = jsonDecode(text);
+    if (obj is! Map<String, dynamic>) {
+      throw Exception("Gemini: model output is not a JSON object");
+    }
 
     final turn = MascotTurn(
       v: (obj["v"] as num).toInt(),
