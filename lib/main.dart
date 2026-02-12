@@ -85,7 +85,56 @@ class AppConfig {
   });
 }
 
-// ===== Models =====
+typedef EmotionId = String;
+
+const String kEmotionIdle = "idle";
+const String kEmotionHappy = "happy";
+const String kEmotionAnnoyed = "annoyed";
+const String kEmotionThink = "think";
+
+const String kSystemPromptTemplateV1 = '''
+あなたはデスクトップマスコットの「次の1ターン」を生成します。
+必ず “JSONオブジェクト1つだけ” を返してください。前置き・解説・Markdown禁止。
+全ての発言（text）において、CHARACTER_PROMPTで示されるキャラクターをロールプレイしてください。
+
+## 出力フォーマット（MascotTurn v1）
+{
+  "v": 1,
+  "text": string,
+  "emotion": string,
+  "choice_profile": "none"|"idle_default"|"rss_default"|"input_offer",
+  "choices": [
+    {"id":"c1"|"c2"|"c3","label":string,"intent":"core.more"|"core.change_topic"|"core.quiet_mode"|"core.ok"|"core.nope"|"core.open_input"|"core.open_link"}
+  ],
+  "debug_line_id": string | null
+}
+
+## 共通ルール
+- textは短く。指定がなければ idle:70文字以内 / rss:90文字以内。
+- URLをtextに含めない（ボタン core.open_link で開く想定）。
+- 断定しすぎない。topicは「タイトルと要旨を渡された」以上の確度で語らない。
+- 質問で終えるのは控えめ（指定がなければ10%以下）。
+- choicesは0〜3個。labelはユーザーが押すUI文言なのでロールプレイ不要。短い日本語で自然に。
+- TOPICにurlがある場合: choices内に intent=core.open_link を必ず1つ含める
+  （choicesを空にするなら choice_profile=rss_default にすること）。
+- choice_profile は “ボタンセットの型” のガイド。choicesを出した場合は choices が優先。
+- 「ユーザーは基本話しかけない」前提で、眺めるだけで成立する一言にする。
+
+## CHARACTER_PROMPT
+{{CHARACTER_PROMPT}}
+
+## 入力（userPrompt）
+- MODE: idle / rss / followup
+- MAX_CHARS: 数字（任意）
+- CHOICE_PROFILE_HINT: none / idle_default / rss_default / input_offer（任意）
+- rss の場合は TOPIC が入る（title/snippet/url/tags）
+- followup の場合は LAST_INTENT が入る
+
+それでは、次の1ターンを生成してJSONだけ返せ。
+''';
+
+String _buildSystemPromptV1(String characterPrompt) =>
+    kSystemPromptTemplateV1.replaceAll("{{CHARACTER_PROMPT}}", characterPrompt.trim());
 
 enum Emotion { idle, happy, annoyed, think }
 
@@ -112,7 +161,7 @@ class MascotChoice {
 class MascotTurn {
   final int v; // always 1
   final String text;
-  final Emotion emotion;
+  final EmotionId emotion;
   final ChoiceProfile choiceProfile;
   final List<MascotChoice> choices;
   final String? debugLineId;
@@ -129,7 +178,7 @@ class MascotTurn {
   MascotTurn.fallback(String text)
       : v = 1,
         text = text,
-        emotion = Emotion.idle,
+        emotion = kEmotionIdle,
         choiceProfile = ChoiceProfile.idleDefault,
         choices = const [],
         debugLineId = "fallback.local";
@@ -137,7 +186,7 @@ class MascotTurn {
   Map<String, dynamic> toLogJson() => {
         "v": v,
         "text": text.length > 240 ? "${text.substring(0, 240)}…" : text,
-        "emotion": emotion.name,
+        "emotion": emotion,
         "choice_profile": _choiceProfileToWire(choiceProfile),
         "choices": choices
             .map((c) => {"id": c.id, "label": c.label, "intent": _intentToWire(c.intent)})
@@ -145,18 +194,9 @@ class MascotTurn {
         "debug_line_id": debugLineId,
       };
 
-  static Emotion parseEmotion(String s) {
-    switch (s) {
-      case "happy":
-        return Emotion.happy;
-      case "annoyed":
-        return Emotion.annoyed;
-      case "think":
-        return Emotion.think;
-      case "idle":
-      default:
-        return Emotion.idle;
-    }
+  static EmotionId parseEmotion(String s) {
+    final t = s.trim().toLowerCase();
+    return t.isEmpty ? kEmotionIdle : t;
   }
 
   static ChoiceProfile parseChoiceProfile(String s) {
@@ -232,10 +272,12 @@ class MascotPack {
   final String id;
   final String name;
   final Size windowSize;
-  final Map<Emotion, SpritePair> sprites;
-  final Emotion defaultEmotion;
+  final Map<EmotionId, SpritePair> sprites;
+  final EmotionId defaultEmotion;
   final ChoiceProfile defaultChoiceProfile;
   final String systemPrompt;
+  List<EmotionId> emotionIds;
+  String characterPrompt;
 
   MascotPack({
     required this.id,
@@ -245,6 +287,8 @@ class MascotPack {
     required this.defaultEmotion,
     required this.defaultChoiceProfile,
     required this.systemPrompt,
+    required this.emotionIds,
+    required this.characterPrompt,
   });
 }
 
@@ -453,44 +497,77 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     return _loadMascotPack(children.first);
   }
 
-  Future<MascotPack> _loadMascotPack(Directory dir) async {
-    final manifestFile = File(p.join(dir.path, "manifest.json"));
-    final systemPromptFile = File(p.join(dir.path, "system_prompt.txt"));
-
-    final manifest = jsonDecode(await manifestFile.readAsString()) as Map<String, dynamic>;
-    final systemPrompt = await systemPromptFile.readAsString();
-
-    final id = manifest["id"] as String;
-    final name = manifest["name"] as String;
-    final window = manifest["window"] as Map<String, dynamic>;
-    final width = (window["width"] as num).toDouble();
-    final height = (window["height"] as num).toDouble();
-
-    final sprites = <Emotion, SpritePair>{};
-    final spritesJson = manifest["sprites"] as Map<String, dynamic>;
-    SpritePair readPair(String key) {
-      final m = spritesJson[key] as Map<String, dynamic>;
-      return SpritePair(
-        closedPath: p.join(dir.path, m["closed"] as String),
-        openPath: p.join(dir.path, m["open"] as String),
-      );
+  Future<MascotPack> _loadMascotPack(Directory mascotDir) async {
+    final manifestFile = File(p.join(mascotDir.path, "manifest.json"));
+    if (!await manifestFile.exists()) {
+      throw Exception("manifest.json not found in ${mascotDir.path}");
     }
 
-    sprites[Emotion.idle] = readPair("idle");
-    sprites[Emotion.happy] = readPair("happy");
-    sprites[Emotion.annoyed] = readPair("annoyed");
-    sprites[Emotion.think] = readPair("think");
+    final manifest = jsonDecode(await manifestFile.readAsString()) as Map<String, dynamic>;
 
-    final defEmotion = MascotTurn.parseEmotion(manifest["default_emotion"] as String);
-    final defProfile = MascotTurn.parseChoiceProfile(manifest["default_choice_profile"] as String);
+    final id = (manifest["id"] as String?) ?? p.basename(mascotDir.path);
+    final name = (manifest["name"] as String?) ?? id;
+
+    // window
+    final window = (manifest["window"] as Map?) ?? const {};
+    final width = (window["width"] as num?)?.toDouble() ?? 256.0;
+    final height = (window["height"] as num?)?.toDouble() ?? 256.0;
+
+    // character prompt (user editable)
+    final characterPromptFile = File(p.join(mascotDir.path, "character_prompt.txt"));
+    final legacySystemPromptFile = File(p.join(mascotDir.path, "system_prompt.txt")); // back-compat
+    String characterPrompt = "";
+    if (await characterPromptFile.exists()) {
+      characterPrompt = await characterPromptFile.readAsString();
+    } else if (await legacySystemPromptFile.exists()) {
+      characterPrompt = await legacySystemPromptFile.readAsString();
+    }
+
+    final systemPrompt = _buildSystemPromptV1(characterPrompt);
+
+    // sprites (emotion id -> {closed/open})
+    final sprites = <EmotionId, SpritePair>{};
+    final spritesJson = manifest["sprites"];
+    if (spritesJson is Map) {
+      for (final e in spritesJson.entries) {
+        final rawKey = e.key.toString().trim();
+        if (rawKey.isEmpty) continue;
+        final key = rawKey.toLowerCase();
+        if (e.value is! Map) continue;
+        final m = e.value as Map;
+        final closedRel = (m["closed"] ?? "").toString();
+        final openRel = (m["open"] ?? "").toString();
+        if (closedRel.isEmpty || openRel.isEmpty) continue;
+
+        sprites[key] = SpritePair(
+          closedPath: p.join(mascotDir.path, closedRel),
+          openPath: p.join(mascotDir.path, openRel),
+        );
+      }
+    }
+    if (sprites.isEmpty) {
+      throw Exception("sprites not found/empty in manifest.json (${mascotDir.path})");
+    }
+
+    EmotionId defaultEmotion =
+        (manifest["default_emotion"] ?? kEmotionIdle).toString().trim().toLowerCase();
+    if (!sprites.containsKey(defaultEmotion)) {
+      defaultEmotion = sprites.containsKey(kEmotionIdle) ? kEmotionIdle : sprites.keys.first;
+    }
+
+    final defChoiceProfile = MascotTurn.parseChoiceProfile(
+      (manifest["default_choice_profile"] ?? "idle_default").toString(),
+    );
 
     return MascotPack(
       id: id,
       name: name,
       windowSize: Size(width, height),
       sprites: sprites,
-      defaultEmotion: defEmotion,
-      defaultChoiceProfile: defProfile,
+      defaultEmotion: defaultEmotion,
+      defaultChoiceProfile: defChoiceProfile,
+      emotionIds: sprites.keys.toList(growable: false),
+      characterPrompt: characterPrompt,
       systemPrompt: systemPrompt,
     );
   }
@@ -609,22 +686,6 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     });
   }
 
-  Future<void> _doLocalIdleTalk() async {
-    final text = _localFallbackPool[Random().nextInt(_localFallbackPool.length)];
-    final t = MascotTurn(
-      v: 1,
-      text: text,
-      emotion: Emotion.think,
-      choiceProfile: _pack?.defaultChoiceProfile ?? ChoiceProfile.idleDefault,
-      choices: const [],
-      debugLineId: "idle.local",
-    );
-
-    setState(() => _turn = t);
-    _startMouthFlap();
-    await _logEvent("turn", {"mode": "idle", "turn": t.toLogJson()});
-  }
-
   Future<void> _doGeminiIdleTalk({String from = "idle"}) async {
     final pack = _pack;
     if (pack == null) return;
@@ -648,6 +709,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         model: "gemini-3-flash-preview",
         systemPrompt: pack.systemPrompt,
         userPrompt: userPrompt,
+        emotionEnum: pack.emotionIds,
       );
 
       // 重複除外チェック
@@ -664,7 +726,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         final fallback = MascotTurn(
           v: 1,
           text: "…さっきと話題が近い。別の話にしよ。",
-          emotion: Emotion.think,
+          emotion: kEmotionIdle,
           choiceProfile: t.choiceProfile,
           choices: t.choices,
           debugLineId: "local.dedupe.skip",
@@ -943,17 +1005,14 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   // === Gemini settings ===
 
-  Map<String, dynamic> _mascotTurnSchema() {
+  Map<String, dynamic> _mascotTurnSchema({required List<String> emotionEnum}) {
     // response_schema は curl例のように大文字Typeを使う形式で合わせます。:contentReference[oaicite:3]{index=3}
     return {
       "type": "OBJECT",
       "properties": {
         "v": {"type": "INTEGER"},
         "text": {"type": "STRING"},
-        "emotion": {
-          "type": "STRING",
-          "enum": ["idle", "happy", "annoyed", "think"]
-        },
+        "emotion": {"type": "STRING", "enum": emotionEnum},
         "choice_profile": {
           "type": "STRING",
           "enum": ["none", "idle_default", "rss_default", "input_offer"]
@@ -994,6 +1053,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     required String model, // "gemini-3-flash-preview"
     required String systemPrompt,
     required String userPrompt,
+    required List<String> emotionEnum,
   }) async {
     final uri = Uri.parse(
       "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey",
@@ -1016,7 +1076,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       ],
       "generationConfig": {
         "response_mime_type": "application/json",
-        "responseJsonSchema": _mascotTurnSchema(),
+        "responseJsonSchema": _mascotTurnSchema(emotionEnum: emotionEnum),
         "temperature": 1.0,
         "thinkingConfig": {
           "thinkingLevel": "low"
@@ -1109,7 +1169,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final b = StringBuffer();
     b.writeln("MODE: $mode");
     b.writeln("MAX_CHARS: $maxChars");
-    b.writeln("CHOICE_PROFILE_HINT: ${mode == "idle" ? "idle_default" : "none"}");
+    final choiceProfileHint = switch (mode) {
+      "idle" => "idle_default",
+      "rss" => "rss_default",
+      _ => "none",
+    };
+    b.writeln("CHOICE_PROFILE_HINT: $choiceProfileHint");
     if (lastIntentWire != null) b.writeln("LAST_INTENT: $lastIntentWire");
     if (lastMascotText != null) b.writeln("LAST_MASCOT_TEXT: $lastMascotText");
     if (topic != null) {
@@ -1595,6 +1660,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         model: "gemini-3-flash-preview",
         systemPrompt: pack.systemPrompt,
         userPrompt: userPrompt,
+        emotionEnum: pack.emotionIds,
       );
 
       // 既読化（採用したので）
