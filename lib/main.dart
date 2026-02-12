@@ -331,6 +331,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   // rss
   static const String _rssSettingsFileName = "rss_feeds.json";
   static const String _rssCacheFileName = "rss_cache.json";
+  static const String _rssStateFileName = "rss_state.json";
+  RssState _rssState = RssState.empty();
+
 
   RssSettings? _rssSettings;
   RssCache _rssCache = RssCache([]);
@@ -378,6 +381,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     // rss
     _rssSettings = await _loadRssSettings();
     await _loadRssCache();
+    await _loadRssState();
 
     if (_rssSettings?.fetchOnStart == true) {
       await _fetchRssOnce(); // エラーはUIとログに出る設計
@@ -396,14 +400,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         globalPos.dx, globalPos.dy, globalPos.dx, globalPos.dy,
       ),
       items: const [
-        PopupMenuItem<String>(
-          value: "update_rss",
-          child: Text("RSS更新"),
-        ),
-        PopupMenuItem<String>(
-          value: "exit",
-          child: Text("終了"),
-        ),
+        const PopupMenuItem(value: "talk_rss", child: Text("RSS 未読を話す")),
+        const PopupMenuItem(value: "update_rss", child: Text("RSS更新")),
+        const PopupMenuItem(value: "exit", child: Text("終了")),
       ],
     );
 
@@ -411,6 +410,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       await windowManager.close();
     } else if (selected == "update_rss") {
       await _fetchRssOnce();
+    } else if (selected == "talk_rss") {
+      await _doGeminiRssTalk();
     }
   }
 
@@ -1182,6 +1183,29 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     }
   }
 
+  Future<void> _loadRssState() async {
+    final f = await _exeSiblingFile(_rssStateFileName);
+    if (!f.existsSync()) {
+      _rssState = RssState.empty();
+      return;
+    }
+    try {
+      _rssState = RssState.fromJson(jsonDecode(await f.readAsString()));
+    } catch (_) {
+      _rssState = RssState.empty();
+    }
+  }
+
+  Future<void> _saveRssState() async {
+    final f = await _exeSiblingFile(_rssStateFileName);
+    await f.writeAsString(const JsonEncoder.withIndent("  ").convert(_rssState.toJson()));
+  }
+
+  String _feedKeyFromUrl(String url) {
+    final h = sha256.convert(utf8.encode(url)).toString();
+    return "u:$h";
+  }
+
   Future<void> _saveRssCache() async {
     final f = await _exeSiblingFile(_rssCacheFileName);
     await f.writeAsString(const JsonEncoder.withIndent("  ").convert(_rssCache.toJson()));
@@ -1189,7 +1213,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   bool _rssHasItemId(String itemId) => _rssCache.items.any((e) => e.itemId == itemId);
 
-  List<RssItem> _parseFeedXml({required String feedId, required String xmlText}) {
+  List<RssItem> _parseFeedXml({required String feedId, required String sourceHost, required String xmlText}) {
     // NOTE: We keep the name for minimal diff, but this is no longer "xml.dart".
     // webfeed supports RSS (0.9/1.0/2.0) and Atom.
     String _bestAtomLink(List<wf.AtomLink>? links) {
@@ -1235,6 +1259,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
         out.add(RssItem(
           feedId: feedId,
+          sourceHost: sourceHost,
           itemId: itemId,
           title: title.isEmpty ? '(no title)' : title,
           link: link,
@@ -1268,6 +1293,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
       out.add(RssItem(
         feedId: feedId,
+        sourceHost: sourceHost,
         itemId: itemId,
         title: title.isEmpty ? '(no title)' : title,
         link: link,
@@ -1336,7 +1362,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         final xmlText = _decodeBodyBytes(resp.bodyBytes);
         List<RssItem> items;
         try {
-          items = _parseFeedXml(feedId: f.id, xmlText: xmlText);
+          final uri = Uri.parse(f.url);
+          final sourceHost = uri.host.toLowerCase();
+          items = _parseFeedXml(feedId: f.id, sourceHost: sourceHost, xmlText: xmlText);
         } catch (e, st) {
           await _logEvent("rss_error", {
             "feed": f.id,
@@ -1355,15 +1383,55 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           final tb = b.publishedAt?.millisecondsSinceEpoch ?? 0;
           return tb.compareTo(ta); // desc
         });
+        
+        final now = DateTime.now();
+        final defaultLookback = s.lookbackDays;
+        final feedLookback = (f.lookbackDays ?? defaultLookback).clamp(1, 3650);
+
+        DateTime since = now.subtract(Duration(days: feedLookback));
+
+        // 前回の lastSeen から「差分」も見る（取りこぼし防止に少しだけ重ねる）
+        final feedKey = _feedKeyFromUrl(f.url);
+        final lastSeenIso = _rssState.lastSeenByFeed[feedKey];
+        final lastSeen = (lastSeenIso == null) ? null : DateTime.tryParse(lastSeenIso);
+        if (lastSeen != null) {
+          final overlap = lastSeen.subtract(const Duration(hours: 6));
+          if (overlap.isAfter(since)) since = overlap;
+        }
 
         int feedAdded = 0;
-        final takeN = min(items.length, perFeedTake);
-        for (final it in items.take(takeN)) {
+        int taken = 0;
+
+        // feedの「最新」を state に進める（新規が無くても進める）
+        DateTime? newestSeenUtc;
+
+        for (final it in items) {
+          if (taken >= perFeedTake) break;
+
+          final pub = it.publishedAt;
+          if (pub != null) {
+            // items は desc ソート済みなので、古くなったら終了
+            if (pub.isBefore(since)) break;
+
+            final u = pub.toUtc();
+            if (newestSeenUtc == null || u.isAfter(newestSeenUtc)) newestSeenUtc = u;
+          }
+
           if (it.title.trim().isEmpty && it.summary.trim().isEmpty) continue;
           if (_rssHasItemId(it.itemId)) continue;
+
+          // 既読は「採用しない」
+          if (_rssState.isRead(it.itemId)) continue;
+
           _rssCache.items.add(it);
           added++;
           feedAdded++;
+          taken++;
+        }
+
+        // lastSeen 更新
+        if (newestSeenUtc != null) {
+          _rssState.lastSeenByFeed[feedKey] = newestSeenUtc.toIso8601String();
         }
 
         await _logEvent("rss", {
@@ -1371,7 +1439,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           "feed": f.id,
           "url": f.url,
           "parsed": items.length,
-          "take": takeN,
+          "take": taken,
           "added": feedAdded,
         });
       } catch (e, st) {
@@ -1395,10 +1463,221 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     }
 
     await _saveRssCache();
+    _rssState.lastFetchAtUtc = DateTime.now().toUtc();
+    await _saveRssState();
     await _logEvent("rss", {"status": "fetch_done", "added": added, "cache_size": _rssCache.items.length});
 
     setState(() => _turn = MascotTurn.fallback("RSS更新: +$added 件（キャッシュ ${_rssCache.items.length}）"));
-   }
+  }
+
+  String _htmlUnescapeLite(String s) {
+    return s
+        .replaceAll("&amp;", "&")
+        .replaceAll("&quot;", "\"")
+        .replaceAll("&#39;", "'")
+        .replaceAll("&lt;", "<")
+        .replaceAll("&gt;", ">");
+  }
+
+  String? _extractMetaDescription(String html) {
+    final og = RegExp(
+      r'''<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']''',
+      caseSensitive: false,
+    );
+    final m1 = og.firstMatch(html);
+    if (m1 != null) return _htmlUnescapeLite(m1.group(1) ?? "").trim();
+
+    final og2 = RegExp(
+      r'''<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']''',
+      caseSensitive: false,
+    );
+    final m3 = og2.firstMatch(html);
+    if (m3 != null) return _htmlUnescapeLite(m3.group(1) ?? "").trim();
+
+    final name = RegExp(
+      r'''<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']''',
+      caseSensitive: false,
+    );
+    final m2 = name.firstMatch(html);
+    if (m2 != null) return _htmlUnescapeLite(m2.group(1) ?? "").trim();
+
+    return null;
+  }
+
+  Future<String?> _fetchLinkPreviewSummary(String url, {required int maxChars}) async {
+    try {
+      final resp = await http
+          .get(
+            Uri.parse(url),
+            headers: {
+              "User-Agent": "nondesu/0.1 (+https://github.com/godmt/nondesu)",
+              "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            },
+          )
+          .timeout(const Duration(seconds: 12));
+
+      if (resp.statusCode != 200) return null;
+
+      final html = utf8.decode(resp.bodyBytes, allowMalformed: true);
+      final desc = _extractMetaDescription(html);
+      if (desc == null || desc.trim().isEmpty) return null;
+
+      final t = desc.trim();
+      return (t.length <= maxChars) ? t : "${t.substring(0, maxChars)}…";
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 「未読を選んで喋る」+ 既読マーキング
+  RssItem? _pickUnreadRssItem() {
+    if (_rssCache.items.isEmpty) return null;
+
+    final items = List<RssItem>.from(_rssCache.items);
+    items.sort((a, b) {
+      final ta = a.publishedAt?.millisecondsSinceEpoch ?? 0;
+      final tb = b.publishedAt?.millisecondsSinceEpoch ?? 0;
+      return tb.compareTo(ta);
+    });
+
+    for (final it in items) {
+      if (_rssState.isRead(it.itemId)) continue;
+      if (it.title.trim().isEmpty && it.summary.trim().isEmpty) continue;
+      return it;
+    }
+    return null;
+  }
+
+  // RSS用Gemini呼び出しを追加（summary補完 + 既読化）
+  Future<void> _doGeminiRssTalk({String from = "rss_menu"}) async {
+    final pack = _pack;
+    final cfg = _config;
+    if (pack == null || cfg == null) return;
+
+    final s = _rssSettings;
+    if (s == null) {
+      setState(() => _turn = MascotTurn.fallback("rss_feeds.json が未設定。"));
+      return;
+    }
+
+    final it = _pickUnreadRssItem();
+    if (it == null) {
+      setState(() => _turn = MascotTurn.fallback("RSS: 未読が無い。"));
+      return;
+    }
+
+    // summaryが無いタイプ（huggingface等）は、採用時だけ link preview
+    if (it.summary.trim().isEmpty &&
+        s.linkPreviewEnabled &&
+        it.link.trim().isNotEmpty &&
+        _domainAllowedForPreview(
+          linkUrl: it.link,
+          sourceHost: it.sourceHost,
+          allowDomains: s.linkPreviewAllowDomains,
+        )) {
+      final sum = await _fetchLinkPreviewSummary(it.link, maxChars: s.linkPreviewMaxChars);
+      if (sum != null && sum.trim().isNotEmpty) {
+        it.summary = sum.trim();
+        await _saveRssCache(); // 補完したのでキャッシュ更新
+      }
+    }
+
+    final topic = {
+      "title": it.title,
+      "snippet": it.summary,
+      "url": it.link,
+    };
+
+    try {
+      final userPrompt = _buildUserPrompt(mode: "rss", maxChars: 90, topic: topic);
+      final t = await _callGeminiTurn(
+        apiKey: cfg.geminiApiKey,
+        model: "gemini-3-flash-preview",
+        systemPrompt: pack.systemPrompt,
+        userPrompt: userPrompt,
+      );
+
+      // 既読化（採用したので）
+      _rssState.markRead(it.itemId, keepMax: s.readKeepMax);
+      await _saveRssState();
+
+      setState(() => _turn = t);
+      await _logEvent("rss", {
+        "status": "picked_unread",
+        "from": from,
+        "picked_item_id": it.itemId,
+        "picked_title": it.title,
+        "picked_url": it.link,
+      });
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": "gemini_rss",
+        "error": e.toString(),
+        "stack": st.toString(),
+      });
+      setState(() => _turn = MascotTurn.fallback("…通信が荒れている。${e.toString()}"));
+    }
+  }
+
+  bool _isPrivateOrLocalHost(String host) {
+    final h = host.toLowerCase();
+    if (h == "localhost" || h.endsWith(".local")) return true;
+    final ip = InternetAddress.tryParse(h);
+    if (ip == null) return false;
+    if (ip.type != InternetAddressType.IPv4) return false;
+    final b = ip.rawAddress;
+    // 10.0.0.0/8
+    if (b[0] == 10) return true;
+    // 172.16.0.0/12
+    if (b[0] == 172 && (b[1] >= 16 && b[1] <= 31)) return true;
+    // 192.168.0.0/16
+    if (b[0] == 192 && b[1] == 168) return true;
+    // 127.0.0.0/8
+    if (b[0] == 127) return true;
+    // 0.0.0.0
+    if (b[0] == 0) return true;
+    return false;
+  }
+
+  // 超ざっくり base-domain（eTLD+1 の正確版は Public Suffix List が必要）
+  // ここでは「末尾2ラベル」を採用。co.uk系は例外があるが、困ったら allow_domains で救済。
+  String _roughBaseDomain(String host) {
+    final parts = host.split('.').where((p) => p.isNotEmpty).toList();
+    if (parts.length <= 2) return host;
+    return "${parts[parts.length - 2]}.${parts[parts.length - 1]}";
+  }
+
+  bool _domainAllowedForPreview({
+    required String linkUrl,
+    required String sourceHost,
+    required List<String> allowDomains, // user optional
+  }) {
+    Uri u;
+    try { u = Uri.parse(linkUrl); } catch (_) { return false; }
+    final scheme = u.scheme.toLowerCase();
+    if (scheme != "http" && scheme != "https") return false;
+
+    final host = u.host.toLowerCase();
+    if (host.isEmpty) return false;
+    if (_isPrivateOrLocalHost(host)) return false;
+
+    // 1) same-domain（デフォルト）
+    if (sourceHost.isNotEmpty) {
+      final a = _roughBaseDomain(host);
+      final b = _roughBaseDomain(sourceHost.toLowerCase());
+      if (a == b) return true;
+      // ついでに「同一host/サブドメイン」も許可
+      if (host == sourceHost.toLowerCase() || host.endsWith(".${sourceHost.toLowerCase()}")) return true;
+    }
+
+    // 2) allow_domains が指定されていれば追加許可（上級者用）
+    for (final d in allowDomains) {
+      final dd = d.toLowerCase().trim();
+      if (dd.isEmpty) continue;
+      if (host == dd || host.endsWith(".$dd")) return true;
+    }
+    return false;
+  }
 }
 
 class _SpeechBubble extends StatelessWidget {
@@ -1613,60 +1892,130 @@ int _parseHex64(String s) {
 // ====== RSS feed helper =====
 
 class RssFeed {
-  final String id;
-  final String url;
+  final String id;        // category id (ai/game/vtuber ...)
+  final String url;       // feed url
   final bool enabled;
-  RssFeed({required this.id, required this.url, required this.enabled});
+  final int? lookbackDays; // optional override per-feed
+
+  RssFeed({
+    required this.id,
+    required this.url,
+    required this.enabled,
+    this.lookbackDays,
+  });
 
   static RssFeed? fromJson(dynamic j) {
     if (j is! Map) return null;
+    final lb = (j["lookback_days"] is num) ? (j["lookback_days"] as num).toInt() : null;
     return RssFeed(
       id: (j["id"] ?? "").toString().trim(),
       url: (j["url"] ?? "").toString().trim(),
       enabled: (j["enabled"] is bool) ? (j["enabled"] as bool) : true,
+      lookbackDays: (lb == null) ? null : lb.clamp(1, 3650),
     );
   }
 
-  Map<String, dynamic> toJson() => {"id": id, "url": url, "enabled": enabled};
+  Map<String, dynamic> toJson() => {
+        "id": id,
+        "url": url,
+        "enabled": enabled,
+        if (lookbackDays != null) "lookback_days": lookbackDays,
+      };
 }
 
 class RssSettings {
   final List<RssFeed> feeds;
   final bool fetchOnStart;
   final int maxCacheItems;
-  RssSettings({required this.feeds, required this.fetchOnStart, required this.maxCacheItems});
+
+  // NEW
+  final int lookbackDays;          // default lookback
+  final int readKeepMax;           // max stored read ids
+  final bool linkPreviewEnabled;   // fetch link -> summary (on pick)
+  final int linkPreviewMaxChars;
+  final List<String> linkPreviewAllowDomains;
+
+  RssSettings({
+    required this.feeds,
+    required this.fetchOnStart,
+    required this.maxCacheItems,
+    required this.lookbackDays,
+    required this.readKeepMax,
+    required this.linkPreviewEnabled,
+    required this.linkPreviewMaxChars,
+    required this.linkPreviewAllowDomains,
+  });
 
   static RssSettings template() => RssSettings(
         feeds: [RssFeed(id: "ai", url: "https://example.com/feed.xml", enabled: true)],
         fetchOnStart: true,
         maxCacheItems: 80,
+        lookbackDays: 7,
+        readKeepMax: 2000,
+        linkPreviewEnabled: true,
+        linkPreviewMaxChars: 240,
+        linkPreviewAllowDomains: const ["huggingface.co"],
       );
 
   Map<String, dynamic> toJson() => {
         "feeds": feeds.map((f) => f.toJson()).toList(),
         "fetch_on_start": fetchOnStart,
         "max_cache_items": maxCacheItems,
+        "lookback_days": lookbackDays,
+        "read_keep_max": readKeepMax,
+        "link_preview": {
+          "enabled": linkPreviewEnabled,
+          "max_chars": linkPreviewMaxChars,
+          "allow_domains": linkPreviewAllowDomains,
+        },
       };
 
   static RssSettings? fromJson(dynamic j) {
     if (j is! Map) return null;
+
     final feedsAny = j["feeds"];
-    final feeds = (feedsAny is List) ? feedsAny.map(RssFeed.fromJson).whereType<RssFeed>().toList() : <RssFeed>[];
+    final feeds = (feedsAny is List)
+        ? feedsAny.map(RssFeed.fromJson).whereType<RssFeed>().toList()
+        : <RssFeed>[];
+
     final fetch = (j["fetch_on_start"] is bool) ? (j["fetch_on_start"] as bool) : true;
     final maxItems = (j["max_cache_items"] is num) ? (j["max_cache_items"] as num).toInt() : 80;
-    return RssSettings(feeds: feeds, fetchOnStart: fetch, maxCacheItems: maxItems.clamp(10, 500));
+
+    final lb = (j["lookback_days"] is num) ? (j["lookback_days"] as num).toInt() : 7;
+    final keep = (j["read_keep_max"] is num) ? (j["read_keep_max"] as num).toInt() : 2000;
+
+    final lp = (j["link_preview"] is Map) ? (j["link_preview"] as Map) : const {};
+    final lpEnabled = (lp["enabled"] is bool) ? (lp["enabled"] as bool) : true;
+    final lpMax = (lp["max_chars"] is num) ? (lp["max_chars"] as num).toInt() : 240;
+    final lpAllowAny = lp["allow_domains"];
+    final lpAllow = (lpAllowAny is List)
+        ? lpAllowAny.map((e) => e.toString()).where((s) => s.trim().isNotEmpty).toList()
+        : <String>["huggingface.co"];
+
+    return RssSettings(
+      feeds: feeds,
+      fetchOnStart: fetch,
+      maxCacheItems: maxItems.clamp(10, 500),
+      lookbackDays: lb.clamp(1, 3650),
+      readKeepMax: keep.clamp(100, 200000),
+      linkPreviewEnabled: lpEnabled,
+      linkPreviewMaxChars: lpMax.clamp(60, 1000),
+      linkPreviewAllowDomains: lpAllow,
+    );
   }
 }
 
 class RssItem {
   final String feedId;
+  final String sourceHost; // ex: "huggingface.co"
   final String itemId; // stable id (guid/link/id)
   final String title;
   final String link;
   final DateTime? publishedAt;
-  final String summary;
+  String summary;
   RssItem({
     required this.feedId,
+    required this.sourceHost,
     required this.itemId,
     required this.title,
     required this.link,
@@ -1676,6 +2025,7 @@ class RssItem {
 
   Map<String, dynamic> toJson() => {
         "feed_id": feedId,
+        "source_host": sourceHost,
         "item_id": itemId,
         "title": title,
         "link": link,
@@ -1687,6 +2037,7 @@ class RssItem {
     if (j is! Map) return null;
     return RssItem(
       feedId: (j["feed_id"] ?? "").toString(),
+      sourceHost: (j["source_host"] ?? "").toString(),
       itemId: (j["item_id"] ?? "").toString(),
       title: (j["title"] ?? "").toString(),
       link: (j["link"] ?? "").toString(),
@@ -1707,6 +2058,68 @@ class RssCache {
     final a = j["items"];
     if (a is! List) return RssCache([]);
     return RssCache(a.map(RssItem.fromJson).whereType<RssItem>().toList());
+  }
+}
+
+class RssState {
+  final int v;
+  DateTime? lastFetchAtUtc;
+
+  // url-hash -> iso8601 utc (last seen publishedAt)
+  final Map<String, String> lastSeenByFeed;
+
+  // newest last
+  final List<String> readItemIds;
+
+  RssState({
+    required this.v,
+    required this.lastFetchAtUtc,
+    required this.lastSeenByFeed,
+    required this.readItemIds,
+  });
+
+  static RssState empty() => RssState(
+        v: 1,
+        lastFetchAtUtc: null,
+        lastSeenByFeed: {},
+        readItemIds: [],
+      );
+
+  bool isRead(String itemId) => readItemIds.contains(itemId);
+
+  void markRead(String itemId, {required int keepMax}) {
+    if (itemId.trim().isEmpty) return;
+    if (readItemIds.contains(itemId)) return;
+    readItemIds.add(itemId);
+    if (readItemIds.length > keepMax) {
+      final drop = readItemIds.length - keepMax;
+      readItemIds.removeRange(0, drop);
+    }
+  }
+
+  Map<String, dynamic> toJson() => {
+        "v": v,
+        "last_fetch_at_utc": lastFetchAtUtc?.toIso8601String(),
+        "last_seen_by_feed": lastSeenByFeed,
+        "read_item_ids": readItemIds,
+      };
+
+  static RssState fromJson(dynamic j) {
+    if (j is! Map) return RssState.empty();
+    final m = (j["last_seen_by_feed"] is Map) ? (j["last_seen_by_feed"] as Map) : const {};
+    final lastSeen = <String, String>{};
+    for (final e in m.entries) {
+      lastSeen[e.key.toString()] = e.value.toString();
+    }
+    final readAny = j["read_item_ids"];
+    final read = (readAny is List) ? readAny.map((e) => e.toString()).toList() : <String>[];
+    final ts = (j["last_fetch_at_utc"] is String) ? DateTime.tryParse(j["last_fetch_at_utc"]) : null;
+    return RssState(
+      v: 1,
+      lastFetchAtUtc: ts,
+      lastSeenByFeed: lastSeen,
+      readItemIds: read,
+    );
   }
 }
 
