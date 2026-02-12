@@ -23,6 +23,7 @@ part 'src/ui_widgets.dart';
 part 'src/dedupe.dart';
 part 'src/fingerprint.dart';
 part 'src/rss_models.dart';
+part 'src/avatar_picker.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

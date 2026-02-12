@@ -11,6 +11,7 @@ class MascotHome extends StatefulWidget {
 
 class _MascotHomeState extends State<MascotHome> with WindowListener {
   MascotPack? _pack;
+  String? _selectedMascotId;
   AppConfig? _config;
   String? _configPath;
   final Map<String, _RgbaMask> _maskCache = {};
@@ -61,15 +62,24 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _boot() async {
-    final pack = await _loadFirstMascotPack();
+    // 1) config json (gemini key may be missing, but we still want avatar selection)
+    final cfgJson = await _loadConfigJson();
+
+    // 2) choose avatar
+    final selectedId = (cfgJson["selected_mascot_id"] ?? "").toString().trim();
+    final pack = await _loadMascotPackByIdOrFirst(selectedId.isEmpty ? null : selectedId);
     if (pack == null) {
       setState(() {
         _turn = MascotTurn.fallback("avatarsが見つからない。…配置、お願い。");
       });
       return;
     }
+
     _pack = pack;
-    _config = await _loadConfig();
+    _selectedMascotId = pack.id;
+
+    // 3) parse app config (may be null until user pastes the key)
+    _config = _parseAppConfig(cfgJson);
     if (_config == null) {
       setState(() {
         _turn = MascotTurn.fallback("設定ファイルが未設定。\n$_configFileName を編集して再起動して。");
@@ -99,18 +109,109 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         globalPos.dx, globalPos.dy, globalPos.dx, globalPos.dy,
       ),
       items: const [
-        const PopupMenuItem(value: "talk_rss", child: Text("RSS 未読を話す")),
-        const PopupMenuItem(value: "update_rss", child: Text("RSS更新")),
-        const PopupMenuItem(value: "exit", child: Text("終了")),
+        PopupMenuItem(value: "avatar", child: Text("アバター変更")),
+        PopupMenuItem(value: "talk_rss", child: Text("RSS 未読を話す")),
+        PopupMenuItem(value: "update_rss", child: Text("RSS更新")),
+        PopupMenuItem(value: "exit", child: Text("終了")),
       ],
     );
 
     if (selected == "exit") {
       await windowManager.close();
+    } else if (selected == "avatar") {
+      await _openAvatarPicker();
     } else if (selected == "update_rss") {
       await _fetchRssOnce();
     } else if (selected == "talk_rss") {
       await _doGeminiRssTalk();
+    }
+  }
+
+  Future<void> _openAvatarPicker() async {
+    final currentPack = _pack;
+    if (currentPack == null) return;
+
+    final oldSize = await windowManager.getSize();
+    const pickerSize = Size(600, 720);
+    await windowManager.setSize(pickerSize);
+    await windowManager.center();
+
+    final avatars = await _scanAvatarSummaries();
+    if (!mounted) return;
+
+    final picked = await showDialog<_AvatarSummary>(
+      context: context,
+      barrierDismissible: true,
+      barrierColor: Colors.transparent,
+      builder: (context) {
+        final base = Theme.of(context);
+        return Theme(
+          data: base.copyWith(
+            brightness: Brightness.dark,
+            // ダイアログ背景
+            dialogTheme: const DialogThemeData(
+              backgroundColor: Color(0xFF14161A),
+              surfaceTintColor: Colors.transparent, // Material3の薄い色被りを消す
+            ),
+            // 文字色（タイトル/本文）
+            textTheme: base.textTheme.apply(
+              bodyColor: Colors.white,
+              displayColor: Colors.white,
+            ),
+            // ダイアログ内のボタン色
+            textButtonTheme: TextButtonThemeData(
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white,
+              ),
+            ),
+          ),
+          child: _AvatarPickerDialog(
+            avatars: avatars,
+            selectedId: _pack?.id,
+          ),
+        );
+      },
+    );
+
+    if (picked == null) {
+      // restore
+      await windowManager.setSize(oldSize);
+      await windowManager.center();
+      return;
+    }
+
+    await _switchMascot(picked);
+  }
+
+  Future<void> _switchMascot(_AvatarSummary picked) async {
+    try {
+      final newPack = await _loadMascotPack(picked.dir);
+      _maskCache.clear();
+      _mouthTimer?.cancel();
+      _mouthTimer = null;
+      _mouthOpen = false;
+
+      setState(() {
+        _pack = newPack;
+        _selectedMascotId = newPack.id;
+        _turn = MascotTurn.fallback("…${newPack.name} に切り替えた");
+      });
+
+      await _setConfigSelectedMascotId(newPack.id);
+      await windowManager.setSize(newPack.windowSize);
+      await windowManager.center();
+      await windowManager.focus();
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": "avatar_switch",
+        "error": _trimForLog(e.toString()),
+        "stack": _trimForLog(st.toString()),
+        "picked": picked.id,
+      });
+      if (!mounted) return;
+      setState(() {
+        _turn = MascotTurn.fallback("アバター切替エラー: ${picked.id}");
+      });
     }
   }
 
@@ -136,20 +237,139 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     }
   }
 
-  Future<MascotPack?> _loadFirstMascotPack() async {
+  Future<List<Directory>> _listMascotDirs() async {
     final baseDir = await _resolveBaseDir();
     final avatarsDir = Directory(p.join(baseDir.path, "avatars"));
-    if (!avatarsDir.existsSync()) return null;
-
+    if (!avatarsDir.existsSync()) return const [];
     final children = avatarsDir
         .listSync()
         .whereType<Directory>()
         .toList()
       ..sort((a, b) => a.path.compareTo(b.path));
-    if (children.isEmpty) return null;
+    return children;
+  }
 
-    // pick first
-    return _loadMascotPack(children.first);
+  Future<MascotPack?> _loadMascotPackByIdOrFirst(String? id) async {
+    final dirs = await _listMascotDirs();
+    if (dirs.isEmpty) return null;
+
+    String? _thumbAbsFromManifest(Map manifest, Directory dir) {
+      final thumbRel = (manifest["thumbnail"] as String?)?.trim();
+      if (thumbRel == null || thumbRel.isEmpty) return null;
+      final abs = p.join(dir.path, thumbRel);
+      if (!File(abs).existsSync()) return null;
+      return abs;
+    }
+
+    if (id != null && id.trim().isNotEmpty) {
+      final wanted = id.trim();
+      for (final d in dirs) {
+        try {
+          final mf = File(p.join(d.path, "manifest.json"));
+          if (!mf.existsSync()) continue;
+          final m = jsonDecode(await mf.readAsString());
+          if (m is! Map) continue;
+          final mid = (m["id"] ?? p.basename(d.path)).toString();
+          if (mid == wanted) {
+            // thumbnail is mandatory
+            if (_thumbAbsFromManifest(m, d) == null) continue;
+            return _loadMascotPack(d);
+          }
+        } catch (_) {
+          // ignore
+        }
+      }
+      // fallback: directory name match
+      for (final d in dirs) {
+        if (p.basename(d.path) == wanted) {
+          try {
+            final mf = File(p.join(d.path, "manifest.json"));
+            if (!mf.existsSync()) continue;
+            final m = jsonDecode(await mf.readAsString());
+            if (m is! Map) continue;
+            if (_thumbAbsFromManifest(m, d) == null) continue;
+            return _loadMascotPack(d);
+          } catch (_) {
+            // ignore
+          }
+        }
+      }
+    }
+
+    // pick first valid mascot (thumbnail must exist)
+    for (final d in dirs) {
+      try {
+        final mf = File(p.join(d.path, "manifest.json"));
+        if (!mf.existsSync()) continue;
+        final m = jsonDecode(await mf.readAsString());
+        if (m is! Map) continue;
+        if (_thumbAbsFromManifest(m, d) == null) continue;
+        return _loadMascotPack(d);
+      } catch (_) {
+        // ignore
+      }
+    }
+    return null;
+  }
+
+  Future<List<_AvatarSummary>> _scanAvatarSummaries() async {
+    final dirs = await _listMascotDirs();
+    final out = <_AvatarSummary>[];
+    for (final d in dirs) {
+      try {
+        final mf = File(p.join(d.path, "manifest.json"));
+        if (!mf.existsSync()) continue;
+        final j = jsonDecode(await mf.readAsString());
+        if (j is! Map) continue;
+        final manifest = j as Map;
+
+        final id = (manifest["id"] ?? p.basename(d.path)).toString();
+        final name = (manifest["name"] ?? id).toString();
+        final description = (manifest["description"] ?? "").toString();
+
+        final window = (manifest["window"] as Map?) ?? const {};
+        final width = (window["width"] as num?)?.toDouble() ?? 256.0;
+        final height = (window["height"] as num?)?.toDouble() ?? 256.0;
+
+        // thumbnail is mandatory
+        final thumbRel = (manifest["thumbnail"] as String?)?.trim();
+        if (thumbRel == null || thumbRel.isEmpty) {
+          await _logEvent("error", {
+            "where": "avatar_scan",
+            "dir": d.path,
+            "error": "manifest.thumbnail is required",
+          });
+          continue;
+        }
+        final thumbAbs = p.join(d.path, thumbRel);
+        if (!File(thumbAbs).existsSync()) {
+          await _logEvent("error", {
+            "where": "avatar_scan",
+            "dir": d.path,
+            "error": "thumbnail file not found: $thumbRel",
+          });
+          continue;
+        }
+
+        out.add(_AvatarSummary(
+          id: id,
+          name: name,
+          description: description,
+          dir: d,
+          thumbnailPath: thumbAbs,
+          windowSize: Size(width, height),
+        ));
+      } catch (e, st) {
+        await _logEvent("error", {
+          "where": "avatar_scan",
+          "dir": d.path,
+          "error": _trimForLog(e.toString()),
+          "stack": _trimForLog(st.toString()),
+        });
+      }
+    }
+    out.sort((a, b) => a.name.compareTo(b.name));
+    return out;
   }
 
   Future<MascotPack> _loadMascotPack(Directory mascotDir) async {
@@ -258,63 +478,91 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     return "${s.substring(0, max)}…(truncated)";
   }
 
-  Future<AppConfig?> _loadConfig() async {
+  Future<Map<String, dynamic>> _loadConfigJson() async {
     final f = await _getConfigFile();
     _configPath = f.path;
 
+    final template = <String, dynamic>{
+      // Gemini
+      "gemini_api_key": "PASTE_YOUR_KEY_HERE",
+
+      // Avatar selection (optional)
+      "selected_mascot_id": "",
+
+      // Talk cadence
+      "idle_talk_min_sec": 30,
+      "idle_talk_max_sec": 90,
+
+      // Dedupe
+      "dedupe_recent_turns": 120,
+      "dedupe_hamming_threshold": 10,
+      "dedupe_prompt_hints": 10,
+    };
+
     if (!f.existsSync()) {
-      // 無ければテンプレを作って、ユーザーに編集してもらう
-      final template = {
-        "gemini_api_key": "PASTE_YOUR_KEY_HERE",
-        "idle_talk_min_sec": 30,
-        "idle_talk_max_sec": 90
-      };
       await f.writeAsString(const JsonEncoder.withIndent("  ").convert(template));
       await _logEvent("config", {"status": "created_template", "path": f.path});
-      return null;
+      return template;
     }
 
     try {
       final raw = await f.readAsString();
       final obj = jsonDecode(raw);
-      if (obj is! Map<String, dynamic>) return null;
-
-      final key = (obj["gemini_api_key"] ?? "").toString().trim();
-      if (key.isEmpty || key == "PASTE_YOUR_KEY_HERE") return null;
-
-      int readInt(String k, int def) {
-        final v = obj[k];
-        if (v is int) return v;
-        if (v is num) return v.toInt();
-        if (v is String) return int.tryParse(v.trim()) ?? def;
-        return def;
+      if (obj is! Map) return template;
+      // merge template defaults (missing keys only)
+      final out = <String, dynamic>{...template};
+      for (final e in obj.entries) {
+        out[e.key.toString()] = e.value;
       }
-
-      // idle interval
-      final minSec = readInt("idle_talk_min_sec", 30);
-      final maxSec = readInt("idle_talk_max_sec", 90);
-
-      // clamp & sanitize (シンプル安全柵)
-      final safeMin = minSec.clamp(3, 24 * 60 * 60);
-      final safeMax = maxSec.clamp(safeMin, 24 * 60 * 60);
-
-      return AppConfig(
-        geminiApiKey: key,
-        idleTalkMinSec: safeMin,
-        idleTalkMaxSec: safeMax, 
-        dedupeRecentTurns: readInt("dedupe_recent_turns", 120),
-        dedupeHammingThreshold: readInt("dedupe_hamming_threshold", 10),
-        dedupePromptHints: readInt("dedupe_prompt_hints", 10),
-      );
+      return out;
     } catch (e, st) {
       await _logEvent("error", {
-        "where": "load_config",
+        "where": "load_config_json",
         "error": _trimForLog(e.toString()),
         "stack": _trimForLog(st.toString()),
         "path": f.path,
       });
-      return null;
+      return template;
     }
+  }
+
+  AppConfig? _parseAppConfig(Map<String, dynamic> obj) {
+    final key = (obj["gemini_api_key"] ?? "").toString().trim();
+    if (key.isEmpty || key == "PASTE_YOUR_KEY_HERE") return null;
+
+    int readInt(String k, int def) {
+      final v = obj[k];
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      if (v is String) return int.tryParse(v.trim()) ?? def;
+      return def;
+    }
+
+    final minSec = readInt("idle_talk_min_sec", 30);
+    final maxSec = readInt("idle_talk_max_sec", 90);
+    final safeMin = minSec.clamp(3, 24 * 60 * 60);
+    final safeMax = maxSec.clamp(safeMin, 24 * 60 * 60);
+
+    return AppConfig(
+      geminiApiKey: key,
+      idleTalkMinSec: safeMin,
+      idleTalkMaxSec: safeMax,
+      dedupeRecentTurns: readInt("dedupe_recent_turns", 120),
+      dedupeHammingThreshold: readInt("dedupe_hamming_threshold", 10),
+      dedupePromptHints: readInt("dedupe_prompt_hints", 10),
+    );
+  }
+
+  Future<void> _setConfigSelectedMascotId(String id) async {
+    final f = await _getConfigFile();
+    final obj = await _loadConfigJson();
+    obj["selected_mascot_id"] = id;
+    await f.writeAsString(const JsonEncoder.withIndent("  ").convert(obj));
+    await _logEvent("config", {
+      "status": "updated_selected_mascot_id",
+      "selected_mascot_id": id,
+      "path": f.path,
+    });
   }
 
   void _scheduleNextIdle() {
