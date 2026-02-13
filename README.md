@@ -13,6 +13,7 @@ Windows 上で動く、小さなデスクトップマスコットです。
 - RSS の記事を拾って雑談（右クリックメニューから更新）
 - ボタンで軽くリアクション（続けて / 別の話 / 詳細を見る など）
 - アバター（キャラ）を複数登録して切り替え
+- ※デフォルトアバターの画像生成には[ぶるぺん様](https://x.com/blue_pen5805)の[true_pencil-XL](https://huggingface.co/bluepen5805/true_pencil-XL)が使われています。感謝！
 
 ![スクリーンショット](assets/screen_shot.png)
 
