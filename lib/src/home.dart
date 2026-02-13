@@ -776,7 +776,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       });
 
       _scheduleNextIdle();
-      _autoCloseBubble(const Duration(milliseconds: 1200));
+      _autoCloseBubble(const Duration(milliseconds: 6500));
       _scheduleNextIdle();
         return;
     }
@@ -790,7 +790,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           _bubbleVisible = true;
         });
         _startMouthFlap();
-        _autoCloseBubble(const Duration(milliseconds: 1200));
+        _autoCloseBubble(const Duration(milliseconds: 6500));
         return;
       }
 
@@ -804,7 +804,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           _bubbleVisible = true;
         });
         _startMouthFlap();
-        _autoCloseBubble(const Duration(milliseconds: 1400));
+        _autoCloseBubble(const Duration(milliseconds: 3000));
         _scheduleNextIdle();
         return;
       }
@@ -829,7 +829,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       await _doGeminiFollowupTalk(lastIntentWire: wire, userText: input);
 
       // 返答を少し見せて閉じる
-      _autoCloseBubble(const Duration(milliseconds: 1800));
+      _autoCloseBubble(const Duration(milliseconds: 6500));
       return;
     }
 
@@ -839,7 +839,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _doGeminiFollowupTalk(lastIntentWire: wire);
 
     // 返答を少し見せて閉じる
-    _autoCloseBubble(const Duration(milliseconds: 1800));
+    _autoCloseBubble(const Duration(milliseconds: 6500));
   }
 
   Future<String?> _showInputDialog() async {
