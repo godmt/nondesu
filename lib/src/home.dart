@@ -21,6 +21,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   bool _mouthOpen = false;
   Timer? _idleTimer;
   Timer? _mouthTimer;
+  bool _eyesOpen = true;
+  Timer? _blinkTimer;
+  final _blinkRng = Random();
   bool _quiet = false;
   DateTime? _quietUntil;
 
@@ -91,6 +94,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   void dispose() {
     _idleTimer?.cancel();
     _mouthTimer?.cancel();
+    _mouthTimer = null;
+    _blinkTimer?.cancel();
+    _blinkTimer = null;
     windowManager.removeListener(this);
     super.dispose();
   }
@@ -111,6 +117,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     _pack = pack;
     _selectedMascotId = pack.id;
+
+    _restartBlinkLoop();
 
     // 3) parse app config (may be null until user pastes the key)
     _config = _parseAppConfig(cfgJson);
@@ -134,6 +142,38 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await windowManager.setSize(pack.windowSize);
     _scheduleNextIdle();
     setState(() {});
+  }
+
+  void _restartBlinkLoop() {
+    _blinkTimer?.cancel();
+    _blinkTimer = null;
+    _eyesOpen = true;
+    _scheduleNextBlink();
+  }
+
+  void _scheduleNextBlink() {
+    // 2.5〜9秒に1回くらい（たまに二連）
+    final waitMs = 2500 + _blinkRng.nextInt(6500);
+    _blinkTimer = Timer(Duration(milliseconds: waitMs), () async {
+      if (!mounted) return;
+
+      setState(() => _eyesOpen = false);
+      await Future.delayed(Duration(milliseconds: 120 + _blinkRng.nextInt(80)));
+      if (!mounted) return;
+      setState(() => _eyesOpen = true);
+
+      // 12%くらいで二連瞬き
+      if (_blinkRng.nextDouble() < 0.12) {
+        await Future.delayed(Duration(milliseconds: 160 + _blinkRng.nextInt(140)));
+        if (!mounted) return;
+        setState(() => _eyesOpen = false);
+        await Future.delayed(Duration(milliseconds: 90 + _blinkRng.nextInt(60)));
+        if (!mounted) return;
+        setState(() => _eyesOpen = true);
+      }
+
+      _scheduleNextBlink();
+    });
   }
 
   Future<void> _showContextMenu(Offset globalPos) async {
@@ -256,7 +296,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     final emotion = turn?.emotion ?? pack.defaultEmotion;
     final sprite = pack.sprites[emotion];
-    final maskPath = sprite?.closedPath; // 口パクしても判定は閉じ画像で十分実用
+    final maskPath = sprite?.basePath; // 口パクしても判定は閉じ画像で十分実用
     if (maskPath == null) return;
 
     _maskCache[maskPath] ??= (await _loadRgbaMask(maskPath)) ?? _maskCache[maskPath]!;
@@ -267,7 +307,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final ok = _isOpaqueAtContainFit(local: localPos, widgetSize: winSize, mask: mask);
 
     if (ok) {
-      await windowManager.startDragging(); // :contentReference[oaicite:8]{index=8}
+      await windowManager.startDragging();
     }
   }
 
@@ -434,8 +474,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     final systemPrompt = _buildSystemPromptV1(characterPrompt);
 
-    // sprites (emotion id -> {closed/open})
-    final sprites = <EmotionId, SpritePair>{};
+    // sprites (emotion id -> {closed/open layers})
+    final sprites = <EmotionId, SpriteLayers>{};
     final spritesJson = manifest["sprites"];
     if (spritesJson is Map) {
       for (final e in spritesJson.entries) {
@@ -444,16 +484,26 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         final key = rawKey.toLowerCase();
         if (e.value is! Map) continue;
         final m = e.value as Map;
-        final closedRel = (m["closed"] ?? "").toString();
-        final openRel = (m["open"] ?? "").toString();
-        if (closedRel.isEmpty || openRel.isEmpty) continue;
 
-        sprites[key] = SpritePair(
-          closedPath: p.join(mascotDir.path, closedRel),
-          openPath: p.join(mascotDir.path, openRel),
+        final baseRel = (m["base"] ?? m["closed"] ?? "").toString();
+        final eyesRel = (m["eyes_open"] ?? m["open"] ?? "").toString();
+        final mouthRel = (m["mouth_open"] ?? "").toString();
+
+        if (baseRel.isEmpty) continue;          // baseは必須
+        // eyes_open が無いと“常時目閉じ”になるので、基本は必須推奨
+        // ただし敢えて許すならここは必須にしない（好みで）
+        final baseAbs = p.join(mascotDir.path, baseRel);
+        final eyesAbs = eyesRel.isEmpty ? null : p.join(mascotDir.path, eyesRel);
+        final mouthAbs = mouthRel.isEmpty ? null : p.join(mascotDir.path, mouthRel);
+
+        sprites[key] = SpriteLayers(
+          basePath: baseAbs,
+          eyesOpenPath: eyesAbs,
+          mouthOpenPath: mouthAbs,
         );
       }
     }
+
     if (sprites.isEmpty) {
       throw Exception("sprites not found/empty in manifest.json (${mascotDir.path})");
     }
@@ -979,11 +1029,38 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final turn = _turn;
 
     final emotion = turn?.emotion ?? pack?.defaultEmotion ?? Emotion.idle;
-    final sprite = pack?.sprites[emotion];
-    final imgPath = (_mouthOpen ? sprite?.openPath : sprite?.closedPath);
+    final s = pack?.sprites[emotion];
 
-    final choiceProfile = turn?.choiceProfile ?? pack?.defaultChoiceProfile ?? ChoiceProfile.idleDefault;
-    final choices = turn?.choices.isNotEmpty == true ? turn!.choices : _choicesForProfile(choiceProfile);
+    final basePath = s?.basePath;
+    final eyesPath = s?.eyesOpenPath;
+    final mouthPath = s?.mouthOpenPath;
+
+    // ✅ ここが「Loading... を残しつつ、合成画像を使う」本体
+    Widget avatarImage;
+    if (pack == null || basePath == null) {
+      avatarImage = const Center(
+        child: Text("Loading...", style: TextStyle(color: Colors.white)),
+      );
+    } else {
+      avatarImage = Stack(
+        alignment: Alignment.center,
+        children: [
+          Image.file(File(basePath), fit: BoxFit.contain),
+          if (_eyesOpen && eyesPath != null)
+            Image.file(File(eyesPath), fit: BoxFit.contain),
+          if (_mouthOpen && mouthPath != null)
+            Image.file(File(mouthPath), fit: BoxFit.contain),
+        ],
+      );
+    }
+
+    // choices は今の方針なら turn?.choices ?? [] で良いはずですが、
+    // 既存ロジックを残すならそのままでOK
+    final choiceProfile =
+        turn?.choiceProfile ?? pack?.defaultChoiceProfile ?? ChoiceProfile.idleDefault;
+    final choices = turn?.choices.isNotEmpty == true
+        ? turn!.choices
+        : _choicesForProfile(choiceProfile);
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -996,9 +1073,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
               onTap: _onAvatarTap,
               onSecondaryTapDown: (d) => _showContextMenu(d.globalPosition),
               onPanStart: (d) => _maybeStartDrag(d.localPosition),
-              child: imgPath == null
-                  ? const Center(child: Text("Loading...", style: TextStyle(color: Colors.white)))
-                  : Image.file(File(imgPath), fit: BoxFit.contain),
+
+              // ✅ ここを imgPath 分岐から avatarImage に置換
+              child: avatarImage,
             ),
           ),
 
@@ -1013,8 +1090,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
                   text: turn?.text ?? "",
                   choices: _isGeminiBusy ? const [] : (turn?.choices ?? const []),
                   onChoice: _onChoice,
-                  isThinking: _isGeminiBusy, // 追加
-                  contextTitle: _bubbleContextTitle, // ←RSSの時だけ入れる
+                  isThinking: _isGeminiBusy,
+                  contextTitle: _bubbleContextTitle,
                 ),
               ),
             ),
@@ -1026,7 +1103,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   // === Gemini settings ===
 
   Map<String, dynamic> _mascotTurnSchema({required List<String> emotionEnum}) {
-    // response_schema は curl例のように大文字Typeを使う形式で合わせます。:contentReference[oaicite:3]{index=3}
+    // response_schema は curl例のように大文字Typeを使う形式で合わせます。
     return {
       "type": "OBJECT",
       "properties": {
@@ -1080,7 +1157,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     );
 
     final body = {
-      // system_instruction のcurl例に合わせて snake_case を使います。:contentReference[oaicite:4]{index=4}
+      // system_instruction のcurl例に合わせて snake_case を使います。
       "system_instruction": {
         "parts": [
           {"text": systemPrompt}

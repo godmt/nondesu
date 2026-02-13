@@ -206,7 +206,7 @@ class MascotPack {
   final String id;
   final String name;
   final Size windowSize;
-  final Map<EmotionId, SpritePair> sprites;
+  final Map<EmotionId, SpriteLayers> sprites;
   final EmotionId defaultEmotion;
   final ChoiceProfile defaultChoiceProfile;
   final String systemPrompt;
@@ -226,11 +226,16 @@ class MascotPack {
   });
 }
 
-class SpritePair {
-  final String closedPath;
-  final String openPath;
+class SpriteLayers {
+  final String basePath;        // 目閉じ+口閉じ
+  final String? eyesOpenPath;   // 目だけ開き（透明背景）
+  final String? mouthOpenPath;  // 口だけ開き（透明背景）
 
-  SpritePair({required this.closedPath, required this.openPath});
+  SpriteLayers({
+    required this.basePath,
+    this.eyesOpenPath,
+    this.mouthOpenPath,
+  });
 }
 
 // Mask for hit testing
