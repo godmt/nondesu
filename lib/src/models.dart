@@ -61,7 +61,7 @@ const String kSystemPromptTemplateV1 = '''
 - MODE: idle / rss / followup
 - MAX_CHARS: 数字（任意）
 - CHOICE_PROFILE_HINT: none / idle_default / rss_default / input_offer（任意）
-- NOW: 1行JSON（現状コンテキスト。短い雑談の種。必要に応じて参考に。）
+- NOW: 1行JSON（現状コンテキスト。短い雑談の種。NOWは“必要な時だけ”自然に言及し、毎ターン日付時刻の話題を繰り返さない。）
   例: {"date":"2026-02-14","time":"09:12","weekday":"Sat","daypart":"morning","tz":"JST","utc_offset":"+09:00","locale":"ja-JP"}
 - rss の場合は TOPIC が入る（title/snippet/url/tags）
 - followup の場合は LAST_INTENT が入る
