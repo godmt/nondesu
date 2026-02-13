@@ -43,6 +43,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   String? _bubbleContextTitle;
   bool _isGeminiBusy = false;
   Timer? _autoCloseBubbleTimer;
+  int _closeBubbleDurationMs = 24000;
 
   void _showBubble() {
     if (!_bubbleVisible) setState(() => _bubbleVisible = true);
@@ -50,19 +51,33 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   void _closeBubbleNow() {
     _autoCloseBubbleTimer?.cancel();
-    if (_bubbleVisible) setState(() => _bubbleVisible = false);
+    if (_bubbleVisible) setState(() {
+      _turn = null;
+      _bubbleVisible = false;
+    });
   }
 
   void _autoCloseBubble([Duration d = const Duration(milliseconds: 1400)]) {
     _autoCloseBubbleTimer?.cancel();
     _autoCloseBubbleTimer = Timer(d, () {
-      if (mounted) setState(() => _bubbleVisible = false);
+      if (mounted) setState(() {
+        _turn = null;
+        _bubbleVisible = false;
+      });
     });
+  }
+
+  void _cancelAutoCloseBubble() {
+    _autoCloseBubbleTimer?.cancel();
   }
 
   void _setGeminiBusy(bool v) {
     if (_isGeminiBusy == v) return;
-    setState(() => _isGeminiBusy = v);
+    if (_isGeminiBusy) _cancelAutoCloseBubble();
+    setState(() {
+      _isGeminiBusy = v;
+      _bubbleVisible = true;
+    });
   }
 
   @override
@@ -603,7 +618,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     final sec = minSec + (span == 0 ? 0 : Random().nextInt(span + 1));
 
     _idleTimer = Timer(Duration(seconds: sec), () async {
-      await _doGeminiIdleTalk(from: "scheduled_idle");
+      _pickUnreadRssItem() != null && Random().nextDouble() < 0.7
+          ? await _doGeminiRssTalk(from: "scheduled_idle")
+          : await _doGeminiIdleTalk(from: "scheduled_idle");
+      _autoCloseBubble(Duration(milliseconds: _closeBubbleDurationMs));
       _scheduleNextIdle();
     });
   }
@@ -620,7 +638,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     );
     if (t == null) return;
 
-    // 重複除外チェック（あなたの既存のまま）
+    // 重複除外チェック
     final reason = _dedupeReason(t);
     if (reason != null) {
       await _logEvent("dedupe_reject", {
@@ -632,10 +650,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
       final fallback = MascotTurn(
         v: 1,
-        text: "…さっきと話題が近い。別の話にしよ。",
+        text: "(…さっきと話題が近い。別の話にしよ。)",
         emotion: kEmotionIdle,
         choiceProfile: t.choiceProfile,
-        choices: t.choices,
+        choices: [],
         debugLineId: "local.dedupe.skip",
       );
 
@@ -738,10 +756,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   Future<void> _onAvatarTap() async {
     // Gemini 通信中の連打は無視（多重呼び出し防止）
     if (_isGeminiBusy) return;
-
     try {
-      // PoC: click triggers immediate talk
-      await _doGeminiIdleTalk(from: "avatar_tap");
+      // click triggers immediate talk
+      _pickUnreadRssItem() != null && Random().nextDouble() < 0.7
+          ? await _doGeminiRssTalk(from: "scheduled_idle")
+          : await _doGeminiIdleTalk(from: "scheduled_idle");
+      _autoCloseBubble(Duration(milliseconds: _closeBubbleDurationMs));
     } finally {
       // 何経由でも「喋った後」はクールダウンをリセット
       _scheduleNextIdle();
@@ -775,8 +795,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         "turn": (_turn ?? MascotTurn.fallback("")).toLogJson(),
       });
 
-      _scheduleNextIdle();
-      _autoCloseBubble(const Duration(milliseconds: 6500));
+      _autoCloseBubble(const Duration(milliseconds: 3000));
       _scheduleNextIdle();
         return;
     }
@@ -790,7 +809,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           _bubbleVisible = true;
         });
         _startMouthFlap();
-        _autoCloseBubble(const Duration(milliseconds: 6500));
+        _autoCloseBubble(const Duration(milliseconds: 3000));
         return;
       }
 
@@ -829,7 +848,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       await _doGeminiFollowupTalk(lastIntentWire: wire, userText: input);
 
       // 返答を少し見せて閉じる
-      _autoCloseBubble(const Duration(milliseconds: 6500));
+      _autoCloseBubble(Duration(milliseconds: _closeBubbleDurationMs));
       return;
     }
 
@@ -839,7 +858,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _doGeminiFollowupTalk(lastIntentWire: wire);
 
     // 返答を少し見せて閉じる
-    _autoCloseBubble(const Duration(milliseconds: 6500));
+    _autoCloseBubble(Duration(milliseconds: _closeBubbleDurationMs));
   }
 
   Future<String?> _showInputDialog() async {
@@ -1586,6 +1605,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _logEvent("rss", {"status": "fetch_done", "added": added, "cache_size": _rssCache.items.length});
 
     setState(() => _turn = MascotTurn.fallback("RSS更新: +$added 件（キャッシュ ${_rssCache.items.length}）"));
+    _autoCloseBubble(const Duration(milliseconds: 3000));
   
     } finally {
       // 何経由でも「喋った後」はクールダウンをリセット
