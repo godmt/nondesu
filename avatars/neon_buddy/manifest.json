@@ -1,12 +1,26 @@
 {
   "id": "neon_buddy",
   "name": "Neon Buddy",
+  "description": "A friendly neon-themed virtual companion to keep you company.",
+  "thumbnail": "sprites/idle_base.png",
   "window": { "width": 360, "height": 520 },
   "sprites": {
-    "idle":   { "closed": "sprites/idle_0.png",   "open": "sprites/idle_1.png" },
-    "happy":  { "closed": "sprites/happy_0.png",  "open": "sprites/happy_1.png" },
-    "annoyed":{ "closed": "sprites/annoyed_0.png","open": "sprites/annoyed_1.png" },
-    "think":  { "closed": "sprites/think_0.png",  "open": "sprites/think_1.png" }
+    "idle": {
+      "base": "sprites/idle_base.png",
+      "eyes_open": "sprites/idle_eyes_open.png"
+    },
+    "happy": {
+      "base": "sprites/happy_base.png",
+      "eyes_open": "sprites/happy_eyes_open.png"
+    },
+    "annoyed": {
+      "base": "sprites/annoyed_base.png",
+      "eyes_open": "sprites/annoyed_eyes_open.png"
+    },
+    "think": {
+      "base": "sprites/think_base.png",
+      "eyes_open": "sprites/think_eyes_open.png"
+    }
   },
   "default_emotion": "idle",
   "default_choice_profile": "idle_default"
