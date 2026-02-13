@@ -1322,6 +1322,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       _ => "none",
     };
     b.writeln("CHOICE_PROFILE_HINT: $choiceProfileHint");
+
+    // 追加: 雑談の元ネタになる最小コンテキスト（1行JSON）
+    b.writeln("NOW: ${jsonEncode(_nowContext())}");
+
     if (lastIntentWire != null) b.writeln("LAST_INTENT: $lastIntentWire");
     if (lastMascotText != null) b.writeln("LAST_MASCOT_TEXT: $lastMascotText");
     if (topic != null) {
@@ -1342,6 +1346,60 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     b.writeln("");
     b.writeln("次の1ターンをJSONで返して。textは短く、URLは入れない。");
     return b.toString();
+  }
+
+  // Datetime
+  String _two(int n) => n.toString().padLeft(2, '0');
+
+  String _fmtDate(DateTime dt) => "${dt.year}-${_two(dt.month)}-${_two(dt.day)}";
+  String _fmtTime(DateTime dt) => "${_two(dt.hour)}:${_two(dt.minute)}";
+
+  String _weekdayShort(int weekday) {
+    // DateTime.weekday: Mon=1 ... Sun=7
+    const w = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    return w[(weekday - 1).clamp(0, 6)];
+  }
+
+  String _daypart(int hour) {
+    if (hour >= 5 && hour < 11) return "morning";
+    if (hour >= 11 && hour < 16) return "afternoon";
+    if (hour >= 16 && hour < 21) return "evening";
+    return "late_night";
+  }
+
+  String _utcOffsetStr(Duration d) {
+    final sign = d.isNegative ? "-" : "+";
+    final m = d.inMinutes.abs();
+    final h = m ~/ 60;
+    final mm = m % 60;
+    return "$sign${_two(h)}:${_two(mm)}";
+  }
+
+  String _localeTag() {
+    // Platform.localeName: "ja_JP" みたいな形が多いので BCP47 風に整形
+    // BCP47（言語タグ標準; なぜこの名: OS/ブラウザがこの形式で言語を表現するため）
+    final raw = Platform.localeName; // dart:io
+    if (raw.contains('_')) {
+      final parts = raw.split('_');
+      if (parts.length >= 2 && parts[0].isNotEmpty && parts[1].isNotEmpty) {
+        return "${parts[0]}-${parts[1]}";
+      }
+    }
+    return raw.replaceAll('_', '-');
+  }
+
+  Map<String, dynamic> _nowContext() {
+    final now = DateTime.now();
+    return {
+      "date": _fmtDate(now),
+      "time": _fmtTime(now),
+      "weekday": _weekdayShort(now.weekday),
+      "daypart": _daypart(now.hour),
+      // TZ（Time Zone: 時差の属する地域情報; なぜこの名: 時刻の解釈ズレを防ぐため）
+      "tz": now.timeZoneName,
+      "utc_offset": _utcOffsetStr(now.timeZoneOffset),
+      "locale": _localeTag(),
+    };
   }
 
   Future<File> _getStateFile() async {
