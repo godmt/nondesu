@@ -15,6 +15,7 @@ import 'package:webfeed/webfeed.dart' as wf;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 part 'src/app.dart';
 part 'src/models.dart';
@@ -24,6 +25,7 @@ part 'src/dedupe.dart';
 part 'src/fingerprint.dart';
 part 'src/rss_models.dart';
 part 'src/avatar_picker.dart';
+part 'src/tts.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

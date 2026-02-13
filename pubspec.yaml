@@ -17,3 +17,4 @@ dependencies:
   crypto: ^3.0.6
   xml: ^5.0.2
   webfeed: ^0.7.0
+  audioplayers: ^6.5.1

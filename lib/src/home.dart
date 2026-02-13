@@ -14,6 +14,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   String? _selectedMascotId;
   AppConfig? _config;
   String? _configPath;
+  late final TtsManager _tts;
   final Map<String, _RgbaMask> _maskCache = {};
 
   // State
@@ -97,6 +98,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     _mouthTimer = null;
     _blinkTimer?.cancel();
     _blinkTimer = null;
+    _tts.dispose();
     windowManager.removeListener(this);
     super.dispose();
   }
@@ -137,6 +139,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     if (_rssSettings?.fetchOnStart == true) {
       await _fetchRssOnce(); // エラーはUIとログに出る設計
     }
+    // tts
+    _tts = TtsManager.fromConfigJson(cfgJson);
     // dedupe state
     await _loadDedupeState();
     await windowManager.setSize(pack.windowSize);
@@ -581,6 +585,20 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       "dedupe_recent_turns": 120,
       "dedupe_hamming_threshold": 10,
       "dedupe_prompt_hints": 10,
+
+      // TTS
+      "tts": {
+        "enabled": false,
+        "provider": "aivis_speech",
+        "output_volume": 0.2,
+        "voice_by_mascot_id": {},
+        "aivis_speech": {
+          "base_url": "http://127.0.0.1:10101",
+          "default_style_id": 0,
+          "use_cancellable_synthesis": false,
+          "speedScale": 1.0
+        }
+      }
     };
 
     if (!f.existsSync()) {
@@ -715,7 +733,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     }
 
     setState(() => _turn = t);
-    _startMouthFlap();
+    await _maybeSpeakGeminiText(t.text, where: "gemini_idle");
     await _recordForDedupe(t);
     await _logEvent("turn", {"mode": "idle", "from": from, "turn": t.toLogJson()});
   }
@@ -751,7 +769,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       _turn = t;
       _bubbleVisible = true;
     });
-    _startMouthFlap();
+    await _maybeSpeakGeminiText(t.text, where: "gemini_followup");
     await _recordForDedupe(t);
     await _logEvent("turn", {"mode": "followup", "from": "followup:$lastIntentWire", "turn": t.toLogJson()});
   
@@ -759,22 +777,54 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       // 何経由でも「喋った後」はクールダウンをリセット
       _scheduleNextIdle();
     }
-}
+  }
 
-  void _startMouthFlap() {
+  void _startMouthFlap({bool continuous = false}) {
     _mouthTimer?.cancel();
     _mouthOpen = false;
 
-    // Simple flap for 1.6 sec
     int ticks = 0;
     _mouthTimer = Timer.periodic(const Duration(milliseconds: 160), (timer) {
       ticks++;
+      if (!mounted) return;
       setState(() => _mouthOpen = !_mouthOpen);
-      if (ticks >= 10) {
+
+      // 旧挙動: 1.6s で止まる
+      if (!continuous && ticks >= 10) {
         timer.cancel();
-        setState(() => _mouthOpen = false);
+        if (mounted) setState(() => _mouthOpen = false);
       }
     });
+  }
+
+  void _stopMouthFlap() {
+    _mouthTimer?.cancel();
+    _mouthTimer = null;
+    if (_mouthOpen && mounted) setState(() => _mouthOpen = false);
+  }
+
+  Future<void> _maybeSpeakGeminiText(String text, {required String where}) async {
+    // TTS OFFなら従来どおり短口パクだけ
+    if (!_tts.enabled) {
+      _startMouthFlap();
+      return;
+    }
+
+    final ok = await _tts.speak(
+      text,
+      mascotId: _selectedMascotId,
+      onAudioStart: () => _startMouthFlap(continuous: true),
+      onAudioDone: () => _stopMouthFlap(),
+    );
+
+    if (!ok) {
+      await _logEvent("tts_error", {
+        "where": where,
+        "error": _trimForLog(_tts.lastError ?? "(unknown)"),
+      });
+      // フォールバック: 音が出せなくても口パクだけはする
+      _startMouthFlap();
+    }
   }
 
   List<MascotChoice> _choicesForProfile(ChoiceProfile p) {
@@ -1887,8 +1937,11 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     _rssState.markRead(it.itemId, keepMax: s.readKeepMax);
     await _saveRssState();
 
-    setState(() => _turn = t);
-    _startMouthFlap();
+    setState(() {
+      _turn = t;
+      _bubbleVisible = true;
+    });
+    await _maybeSpeakGeminiText(t.text, where: "gemini_rss");
     await _recordForDedupe(t);
 
     await _logEvent("rss", {
