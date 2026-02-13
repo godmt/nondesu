@@ -1,6 +1,6 @@
 # nondesu（nondescript desktop mascot）
 
-Windows 上で動く、小さなデスクトップマスコットです。  
+Windows上で動く、何の変哲も無いデスクトップマスコットです。  
 普段は“ひとりごと”をつぶやき、たまに RSS の記事をネタに雑談します。  
 返答生成には **Google Gemini** を使います（あなたの API キーをアプリに設定します）。
 
