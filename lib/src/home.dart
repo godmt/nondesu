@@ -656,6 +656,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     required String lastIntentWire,
     String? userText,
   }) async {
+    try {
+
     final base = _buildUserPrompt(
       mode: "followup",
       maxChars: 90,
@@ -684,7 +686,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     _startMouthFlap();
     await _recordForDedupe(t);
     await _logEvent("turn", {"mode": "followup", "from": "followup:$lastIntentWire", "turn": t.toLogJson()});
-  }
+  
+    } finally {
+      // 何経由でも「喋った後」はクールダウンをリセット
+      _scheduleNextIdle();
+    }
+}
 
   void _startMouthFlap() {
     _mouthTimer?.cancel();
@@ -729,8 +736,16 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _onAvatarTap() async {
-    // PoC: click triggers immediate talk
-    await _doGeminiIdleTalk(from: "avatar_tap");
+    // Gemini 通信中の連打は無視（多重呼び出し防止）
+    if (_isGeminiBusy) return;
+
+    try {
+      // PoC: click triggers immediate talk
+      await _doGeminiIdleTalk(from: "avatar_tap");
+    } finally {
+      // 何経由でも「喋った後」はクールダウンをリセット
+      _scheduleNextIdle();
+    }
   }
 
   Future<void> _onChoice(Intent intent) async {
@@ -762,7 +777,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
       _scheduleNextIdle();
       _autoCloseBubble(const Duration(milliseconds: 1200));
-      return;
+      _scheduleNextIdle();
+        return;
     }
 
     // open link はローカルで完結（既定ブラウザ）
@@ -789,10 +805,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
         });
         _startMouthFlap();
         _autoCloseBubble(const Duration(milliseconds: 1400));
+        _scheduleNextIdle();
         return;
       }
 
       // 成功したら即閉じ
+      _scheduleNextIdle();
       _closeBubbleNow();
       return;
     }
@@ -1162,6 +1180,11 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return null;
     }
 
+    // 多重呼び出し防止（クリック連打・別モード同時実行）
+
+    if (_isGeminiBusy) return null;
+
+
     _setGeminiBusy(true);
     _showBubble(); // busy中の …… を見せる前提
     try {
@@ -1398,6 +1421,8 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _fetchRssOnce() async {
+    try {
+
     final s = _rssSettings;
     if (s == null) {
       setState(() => _turn = MascotTurn.fallback("rss_feeds.json が未設定。exe隣に作ったテンプレを編集して。"));
@@ -1561,7 +1586,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _logEvent("rss", {"status": "fetch_done", "added": added, "cache_size": _rssCache.items.length});
 
     setState(() => _turn = MascotTurn.fallback("RSS更新: +$added 件（キャッシュ ${_rssCache.items.length}）"));
-  }
+  
+    } finally {
+      // 何経由でも「喋った後」はクールダウンをリセット
+      _scheduleNextIdle();
+    }
+}
 
   String _htmlUnescapeLite(String s) {
     return s
@@ -1643,6 +1673,11 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   // RSS用Gemini呼び出しを追加（summary補完 + 既読化）
   Future<void> _doGeminiRssTalk({String from = "rss_menu"}) async {
+    // Gemini 通信中は開始しない（多重呼び出し防止）
+    if (_isGeminiBusy) return;
+
+    try {
+
     final pack = _pack;
     final cfg = _config;
     if (pack == null || cfg == null) return;
@@ -1709,7 +1744,12 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       "picked_url": it.link,
     });
     await _logEvent("turn", {"mode": "rss", "from": from, "turn": t.toLogJson()});
-  }
+  
+    } finally {
+      // 何経由でも「喋った後」はクールダウンをリセット
+      _scheduleNextIdle();
+    }
+}
 
   bool _isPrivateOrLocalHost(String host) {
     final h = host.toLowerCase();
