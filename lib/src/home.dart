@@ -40,6 +40,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
   // GeminiBusy flag and Speech bubble
   bool _bubbleVisible = true;
+  String? _bubbleContextTitle;
   bool _isGeminiBusy = false;
   Timer? _autoCloseBubbleTimer;
 
@@ -608,6 +609,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _doGeminiIdleTalk({String from = "idle"}) async {
+    _bubbleContextTitle = null;
     final userPrompt = _buildUserPrompt(mode: "idle", maxChars: 70);
 
     final t = await _requestGeminiTurn(
@@ -650,19 +652,27 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     await _logEvent("turn", {"mode": "idle", "from": from, "turn": t.toLogJson()});
   }
 
-  Future<void> _doGeminiFollowupTalk({required String lastIntentWire}) async {
-    final userPrompt = _buildUserPrompt(
+  Future<void> _doGeminiFollowupTalk({
+    required String lastIntentWire,
+    String? userText,
+  }) async {
+    final base = _buildUserPrompt(
       mode: "followup",
       maxChars: 90,
       lastIntentWire: lastIntentWire,
       lastMascotText: _turn?.text,
       topic: null,
     );
+    _bubbleContextTitle = null;
+    // free input がある時だけ追記（_buildUserPromptの改造は不要）
+    final userPrompt = (userText == null || userText.trim().isEmpty)
+        ? base
+        : "$base\nUSER_INPUT: ${userText.trim()}\n";
 
     final t = await _requestGeminiTurn(
       where: "gemini_followup",
       mode: "followup",
-      from: "followup", // ログ用途。要らなければ "" でもOK
+      from: "followup:$lastIntentWire",
       userPrompt: userPrompt,
     );
     if (t == null) return;
@@ -673,7 +683,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     });
     _startMouthFlap();
     await _recordForDedupe(t);
-    await _logEvent("turn", {"mode": "followup", "from": "followup", "turn": t.toLogJson()});
+    await _logEvent("turn", {"mode": "followup", "from": "followup:$lastIntentWire", "turn": t.toLogJson()});
   }
 
   void _startMouthFlap() {
@@ -724,65 +734,94 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _onChoice(Intent intent) async {
-    await _logEvent("choice", {"intent": _intentToWire(intent)});
+    // 通信中の多重クリック防止（UI側で無効化してても保険）
+    if (_isGeminiBusy) return;
 
-    // クリックした瞬間は一旦「通信中」表示にする（open_link 以外）
-    _showBubble();
-    _autoCloseBubbleTimer?.cancel();
+    final wire = _intentToWire(intent);
+    await _logEvent("choice", {"intent": wire});
 
+    // どのボタンでも「押した瞬間」いったん閉じる
+    _closeBubbleNow();
+
+    // quiet はローカルで完結
     if (intent == Intent.quietMode) {
       _quietUntil = DateTime.now().add(const Duration(minutes: 30));
       _quiet = true;
+
+      // 返答は短く見せてすぐ閉じる（好みで 0ms にしてもOK）
       setState(() {
         _turn = MascotTurn.fallback("…了解。しばらく静かにしてる。");
+        _bubbleVisible = true;
       });
+      _startMouthFlap();
+      await _logEvent("turn", {
+        "mode": "local",
+        "from": "choice:$wire",
+        "turn": (_turn ?? MascotTurn.fallback("")).toLogJson(),
+      });
+
       _scheduleNextIdle();
+      _autoCloseBubble(const Duration(milliseconds: 1200));
       return;
     }
 
-    // For now: local followups
-    if (intent == Intent.changeTopic) {
-      await _doGeminiIdleTalk(from: "user_change_topic");
-      return;
-    }
-    if (intent == Intent.more) {
-      setState(() {
-        _turn = MascotTurn.fallback("うん。…今の話、もう一口だけ続けるとさ。");
-      });
-      _startMouthFlap();
-      return;
-    }
-    if (intent == Intent.openInput) {
-      final input = await _showInputDialog();
-      if (input == null || input.trim().isEmpty) return;
-      setState(() {
-        _turn = MascotTurn.fallback("ふむ。…その話、ちゃんと聞く。");
-      });
-      _startMouthFlap();
-      return;
-    }
+    // open link はローカルで完結（既定ブラウザ）
     if (intent == Intent.openLink) {
       final url = _lastOpenLinkUrl;
       if (url == null || url.trim().isEmpty) {
         setState(() {
           _turn = MascotTurn.fallback("…元記事URLが無いみたい。");
+          _bubbleVisible = true;
         });
         _startMouthFlap();
+        _autoCloseBubble(const Duration(milliseconds: 1200));
         return;
       }
 
       final ok = await _openExternalUrl(url);
       await _logEvent("open_link", {"url": url, "ok": ok});
 
+      // 失敗時だけ短く通知（成功時は閉じるだけ）
       if (!ok) {
         setState(() {
           _turn = MascotTurn.fallback("…開けなかった。ログに残した。");
+          _bubbleVisible = true;
         });
         _startMouthFlap();
+        _autoCloseBubble(const Duration(milliseconds: 1400));
+        return;
       }
+
+      // 成功したら即閉じ
       _closeBubbleNow();
       return;
     }
+
+    // open input は入力を取って followup へ
+    if (intent == Intent.openInput) {
+      final input = await _showInputDialog();
+      if (input == null || input.trim().isEmpty) {
+        // キャンセル時は何もしない（閉じたまま）
+        return;
+      }
+
+      // 通信中の “……” を表示
+      _showBubble();
+      _autoCloseBubbleTimer?.cancel();
+      await _doGeminiFollowupTalk(lastIntentWire: wire, userText: input);
+
+      // 返答を少し見せて閉じる
+      _autoCloseBubble(const Duration(milliseconds: 1800));
+      return;
+    }
+
+    // それ以外（more/changeTopic/ok/nope）は全部 followup に統一
+    _showBubble();
+    _autoCloseBubbleTimer?.cancel();
+    await _doGeminiFollowupTalk(lastIntentWire: wire);
+
+    // 返答を少し見せて閉じる
+    _autoCloseBubble(const Duration(milliseconds: 1800));
   }
 
   Future<String?> _showInputDialog() async {
@@ -934,10 +973,11 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
                 padding: const EdgeInsets.fromLTRB(14, 14, 14, 18),
                 child: _SpeechBubble(
                   title: pack?.name ?? "Mascot",
-                  text: _isGeminiBusy ? "" : (turn?.text ?? ""),
+                  text: turn?.text ?? "",
                   choices: _isGeminiBusy ? const [] : (turn?.choices ?? const []),
                   onChoice: _onChoice,
                   isThinking: _isGeminiBusy, // 追加
+                  contextTitle: _bubbleContextTitle, // ←RSSの時だけ入れる
                 ),
               ),
             ),
@@ -1618,6 +1658,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       setState(() => _turn = MascotTurn.fallback("RSS: 未読が無い。"));
       return;
     }
+    _bubbleContextTitle = it.title;
 
     // summaryが無いタイプは採用時だけ link preview（あなたの現行のまま）
     if (it.summary.trim().isEmpty &&
