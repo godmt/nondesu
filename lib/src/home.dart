@@ -803,7 +803,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     }
   }
 
-  Future<void> _onAvatarTap() async {
+  Future<void> _onAvatarDoubleTap() async {
     // Gemini 通信中の連打は無視（多重呼び出し防止）
     if (_isGeminiBusy) return;
     try {
@@ -1070,7 +1070,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
-              onTap: _onAvatarTap,
+              onDoubleTap: _onAvatarDoubleTap,
               onSecondaryTapDown: (d) => _showContextMenu(d.globalPosition),
               onPanStart: (d) => _maybeStartDrag(d.localPosition),
 
