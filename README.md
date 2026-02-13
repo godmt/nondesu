@@ -146,7 +146,7 @@ RSS の `link` は外部URLです。全部を無条件で取りに行くと、
 
 1) `manifest.json`（キャラ定義）  
 2) `system_prompt.txt`（性格・表情の説明）  
-3) `sprites/`（画像。口パク用に closed/open があると良い）
+3) `sprites/`（アバター画像：目の開閉差分、口パク差分（人に））
 
 ### manifest.json（重要）
 `thumbnail` は **必須**です。`sprites/` 配下の画像を指定できます（表情画像の流用でも専用サムネでもOK）。
@@ -158,13 +158,25 @@ RSS の `link` は外部URLです。全部を無条件で取りに行くと、
   "id": "neon_buddy",
   "name": "Neon Buddy",
   "description": "A friendly neon-themed virtual companion to keep you company.",
-  "thumbnail": "sprites/idle_1.png",
+  "thumbnail": "sprites/idle_base.png",
   "window": { "width": 360, "height": 520 },
   "sprites": {
-    "idle":    { "closed": "sprites/idle_0.png",    "open": "sprites/idle_1.png" },
-    "happy":   { "closed": "sprites/happy_0.png",   "open": "sprites/happy_1.png" },
-    "annoyed": { "closed": "sprites/annoyed_0.png", "open": "sprites/annoyed_1.png" },
-    "think":   { "closed": "sprites/think_0.png",   "open": "sprites/think_1.png" }
+    "idle": {
+      "base": "sprites/idle_base.png",
+      "eyes_open": "sprites/idle_eyes_open.png"
+    },
+    "happy": {
+      "base": "sprites/happy_base.png",
+      "eyes_open": "sprites/happy_eyes_open.png"
+    },
+    "annoyed": {
+      "base": "sprites/annoyed_base.png",
+      "eyes_open": "sprites/annoyed_eyes_open.png"
+    },
+    "think": {
+      "base": "sprites/think_base.png",
+      "eyes_open": "sprites/think_eyes_open.png"
+    }
   },
   "default_emotion": "idle",
   "default_choice_profile": "idle_default"
