@@ -33,18 +33,36 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   static const String _rssCacheFileName = "rss_cache.json";
   static const String _rssStateFileName = "rss_state.json";
   RssState _rssState = RssState.empty();
-
+  String? _lastOpenLinkUrl; // 直近の「元記事」URL（rss talkでセット）
 
   RssSettings? _rssSettings;
   RssCache _rssCache = RssCache([]);
 
-  // Minimal "LLM not wired yet" talk pool
-  final _localFallbackPool = const [
-    "雨音って、都市のノイズをちょっとだけ丸くするよね。",
-    "ネオンは正直だよ。光る気分の日だけ光る。",
-    "…無理しない。今日はそれで十分。",
-    "観察してるだけで、世界はわりと面白い。",
-  ];
+  // GeminiBusy flag and Speech bubble
+  bool _bubbleVisible = true;
+  bool _isGeminiBusy = false;
+  Timer? _autoCloseBubbleTimer;
+
+  void _showBubble() {
+    if (!_bubbleVisible) setState(() => _bubbleVisible = true);
+  }
+
+  void _closeBubbleNow() {
+    _autoCloseBubbleTimer?.cancel();
+    if (_bubbleVisible) setState(() => _bubbleVisible = false);
+  }
+
+  void _autoCloseBubble([Duration d = const Duration(milliseconds: 1400)]) {
+    _autoCloseBubbleTimer?.cancel();
+    _autoCloseBubbleTimer = Timer(d, () {
+      if (mounted) setState(() => _bubbleVisible = false);
+    });
+  }
+
+  void _setGeminiBusy(bool v) {
+    if (_isGeminiBusy == v) return;
+    setState(() => _isGeminiBusy = v);
+  }
 
   @override
   void initState() {
@@ -590,70 +608,72 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   }
 
   Future<void> _doGeminiIdleTalk({String from = "idle"}) async {
-    final pack = _pack;
-    if (pack == null) return;
+    final userPrompt = _buildUserPrompt(mode: "idle", maxChars: 70);
 
-    final cfg = _config;
-    if (cfg == null) {
-      setState(() => _turn = MascotTurn.fallback(
-          "APIキー未設定。\n$_configFileName を exe と同じフォルダに置いて、gemini_api_key を書いて再起動して。\n($_configPath)"));
-      await _logEvent("error", {
-        "where": "gemini_idle",
-        "error": "missing_config_or_key",
-        "config_path": _configPath,
+    final t = await _requestGeminiTurn(
+      where: "gemini_idle",
+      mode: "idle",
+      from: from,
+      userPrompt: userPrompt,
+    );
+    if (t == null) return;
+
+    // 重複除外チェック（あなたの既存のまま）
+    final reason = _dedupeReason(t);
+    if (reason != null) {
+      await _logEvent("dedupe_reject", {
+        "reason": reason,
+        "state_path": _statePath,
+        "text": _trimForLog(t.text),
+        "debug_line_id": t.debugLineId,
       });
+
+      final fallback = MascotTurn(
+        v: 1,
+        text: "…さっきと話題が近い。別の話にしよ。",
+        emotion: kEmotionIdle,
+        choiceProfile: t.choiceProfile,
+        choices: t.choices,
+        debugLineId: "local.dedupe.skip",
+      );
+
+      setState(() => _turn = fallback);
+      _startMouthFlap();
+      await _recordForDedupe(fallback);
+      await _logEvent("turn", {"mode": "idle", "from": from, "turn": fallback.toLogJson()});
       return;
     }
 
-    try {
-      final userPrompt = _buildUserPrompt(mode: "idle", maxChars: 70);
-      final t = await _callGeminiTurn(
-        apiKey: cfg.geminiApiKey,
-        model: "gemini-3-flash-preview",
-        systemPrompt: pack.systemPrompt,
-        userPrompt: userPrompt,
-        emotionEnum: pack.emotionIds,
-      );
+    setState(() => _turn = t);
+    _startMouthFlap();
+    await _recordForDedupe(t);
+    await _logEvent("turn", {"mode": "idle", "from": from, "turn": t.toLogJson()});
+  }
 
-      // 重複除外チェック
-      final reason = _dedupeReason(t);
-      if (reason != null) {
-        await _logEvent("dedupe_reject", {
-          "reason": reason,
-          "state_path": _statePath,
-          "text": _trimForLog(t.text),
-          "debug_line_id": t.debugLineId,
-        });
+  Future<void> _doGeminiFollowupTalk({required String lastIntentWire}) async {
+    final userPrompt = _buildUserPrompt(
+      mode: "followup",
+      maxChars: 90,
+      lastIntentWire: lastIntentWire,
+      lastMascotText: _turn?.text,
+      topic: null,
+    );
 
-        // フォールバック台詞（短い固定セット）
-        final fallback = MascotTurn(
-          v: 1,
-          text: "…さっきと話題が近い。別の話にしよ。",
-          emotion: kEmotionIdle,
-          choiceProfile: t.choiceProfile,
-          choices: t.choices,
-          debugLineId: "local.dedupe.skip",
-        );
+    final t = await _requestGeminiTurn(
+      where: "gemini_followup",
+      mode: "followup",
+      from: "followup", // ログ用途。要らなければ "" でもOK
+      userPrompt: userPrompt,
+    );
+    if (t == null) return;
 
-        setState(() => _turn = fallback);
-        _startMouthFlap();
-        await _recordForDedupe(fallback);
-        await _logEvent("turn", {"mode": "idle", "from": from, "turn": fallback.toLogJson()});
-        return;
-      }
-
-      setState(() => _turn = t);
-      _startMouthFlap();
-      await _recordForDedupe(t);
-      await _logEvent("turn", {"mode": "idle", "from": from, "turn": t.toLogJson()});
-    } catch (e, st) {
-      await _logEvent("error", {
-        "where": "gemini_idle",
-        "error": _trimForLog(e.toString()),
-        "stack": _trimForLog(st.toString()),
-      });
-      setState(() => _turn = MascotTurn.fallback("…エラー。${e.toString()}"));
-    }
+    setState(() {
+      _turn = t;
+      _bubbleVisible = true;
+    });
+    _startMouthFlap();
+    await _recordForDedupe(t);
+    await _logEvent("turn", {"mode": "followup", "from": "followup", "turn": t.toLogJson()});
   }
 
   void _startMouthFlap() {
@@ -706,6 +726,10 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   Future<void> _onChoice(Intent intent) async {
     await _logEvent("choice", {"intent": _intentToWire(intent)});
 
+    // クリックした瞬間は一旦「通信中」表示にする（open_link 以外）
+    _showBubble();
+    _autoCloseBubbleTimer?.cancel();
+
     if (intent == Intent.quietMode) {
       _quietUntil = DateTime.now().add(const Duration(minutes: 30));
       _quiet = true;
@@ -738,10 +762,25 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return;
     }
     if (intent == Intent.openLink) {
-      setState(() {
-        _turn = MascotTurn.fallback("元記事は…今は手動で開いてね（PoC）。");
-      });
-      _startMouthFlap();
+      final url = _lastOpenLinkUrl;
+      if (url == null || url.trim().isEmpty) {
+        setState(() {
+          _turn = MascotTurn.fallback("…元記事URLが無いみたい。");
+        });
+        _startMouthFlap();
+        return;
+      }
+
+      final ok = await _openExternalUrl(url);
+      await _logEvent("open_link", {"url": url, "ok": ok});
+
+      if (!ok) {
+        setState(() {
+          _turn = MascotTurn.fallback("…開けなかった。ログに残した。");
+        });
+        _startMouthFlap();
+      }
+      _closeBubbleNow();
       return;
     }
   }
@@ -888,16 +927,17 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
           ),
 
           // Speech bubble
-          if (turn != null)
+          if (_bubbleVisible && (turn != null || _isGeminiBusy))
             Align(
               alignment: Alignment.bottomCenter,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(14, 14, 14, 18),
                 child: _SpeechBubble(
                   title: pack?.name ?? "Mascot",
-                  text: turn.text,
-                  choices: choices,
+                  text: _isGeminiBusy ? "" : (turn?.text ?? ""),
+                  choices: _isGeminiBusy ? const [] : (turn?.choices ?? const []),
                   onChoice: _onChoice,
+                  isThinking: _isGeminiBusy, // 追加
                 ),
               ),
             ),
@@ -1059,6 +1099,51 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     );
 
     return turn;
+  }
+
+  Future<MascotTurn?> _requestGeminiTurn({
+    required String where,        // "gemini_idle" / "gemini_rss" / "gemini_followup" など
+    required String mode,         // idle|rss|followup
+    required String from,         // ログ用（不要なら "" でもOK）
+    required String userPrompt,
+  }) async {
+    final pack = _pack;
+    if (pack == null) return null;
+
+    final cfg = _config;
+    if (cfg == null || cfg.geminiApiKey.trim().isEmpty) {
+      setState(() => _turn = MascotTurn.fallback(
+          "APIキー未設定。\n$_configFileName を exe と同じフォルダに置いて、gemini_api_key を書いて再起動して。\n($_configPath)"));
+      await _logEvent("error", {
+        "where": where,
+        "error": "missing_config_or_key",
+        "config_path": _configPath,
+      });
+      return null;
+    }
+
+    _setGeminiBusy(true);
+    _showBubble(); // busy中の …… を見せる前提
+    try {
+      final t = await _callGeminiTurn(
+        apiKey: cfg.geminiApiKey,
+        model: "gemini-3-flash-preview",
+        systemPrompt: pack.systemPrompt,
+        userPrompt: userPrompt,
+        emotionEnum: pack.emotionIds,
+      );
+      return t;
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": where,
+        "error": _trimForLog(e.toString()),
+        "stack": _trimForLog(st.toString()),
+      });
+      setState(() => _turn = MascotTurn.fallback("…通信が荒れている。${e.toString()}"));
+      return null;
+    } finally {
+      _setGeminiBusy(false);
+    }
   }
 
   String _buildUserPrompt({
@@ -1534,7 +1619,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return;
     }
 
-    // summaryが無いタイプ（huggingface等）は、採用時だけ link preview
+    // summaryが無いタイプは採用時だけ link preview（あなたの現行のまま）
     if (it.summary.trim().isEmpty &&
         s.linkPreviewEnabled &&
         it.link.trim().isNotEmpty &&
@@ -1546,7 +1631,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       final sum = await _fetchLinkPreviewSummary(it.link, maxChars: s.linkPreviewMaxChars);
       if (sum != null && sum.trim().isNotEmpty) {
         it.summary = sum.trim();
-        await _saveRssCache(); // 補完したのでキャッシュ更新
+        await _saveRssCache();
       }
     }
 
@@ -1555,37 +1640,34 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       "snippet": it.summary,
       "url": it.link,
     };
+    _lastOpenLinkUrl = it.link.trim().isEmpty ? null : it.link.trim();
 
-    try {
-      final userPrompt = _buildUserPrompt(mode: "rss", maxChars: 90, topic: topic);
-      final t = await _callGeminiTurn(
-        apiKey: cfg.geminiApiKey,
-        model: "gemini-3-flash-preview",
-        systemPrompt: pack.systemPrompt,
-        userPrompt: userPrompt,
-        emotionEnum: pack.emotionIds,
-      );
+    final userPrompt = _buildUserPrompt(mode: "rss", maxChars: 90, topic: topic);
 
-      // 既読化（採用したので）
-      _rssState.markRead(it.itemId, keepMax: s.readKeepMax);
-      await _saveRssState();
+    final t = await _requestGeminiTurn(
+      where: "gemini_rss",
+      mode: "rss",
+      from: from,
+      userPrompt: userPrompt,
+    );
+    if (t == null) return;
 
-      setState(() => _turn = t);
-      await _logEvent("rss", {
-        "status": "picked_unread",
-        "from": from,
-        "picked_item_id": it.itemId,
-        "picked_title": it.title,
-        "picked_url": it.link,
-      });
-    } catch (e, st) {
-      await _logEvent("error", {
-        "where": "gemini_rss",
-        "error": e.toString(),
-        "stack": st.toString(),
-      });
-      setState(() => _turn = MascotTurn.fallback("…通信が荒れている。${e.toString()}"));
-    }
+    // 既読化（採用したので）
+    _rssState.markRead(it.itemId, keepMax: s.readKeepMax);
+    await _saveRssState();
+
+    setState(() => _turn = t);
+    _startMouthFlap();
+    await _recordForDedupe(t);
+
+    await _logEvent("rss", {
+      "status": "picked_unread",
+      "from": from,
+      "picked_item_id": it.itemId,
+      "picked_title": it.title,
+      "picked_url": it.link,
+    });
+    await _logEvent("turn", {"mode": "rss", "from": from, "turn": t.toLogJson()});
   }
 
   bool _isPrivateOrLocalHost(String host) {
@@ -1646,5 +1728,49 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       if (host == dd || host.endsWith(".$dd")) return true;
     }
     return false;
+  }
+
+  Future<bool> _openExternalUrl(String url) async {
+    // 安全のため http/https のみ許可（file:// 等は弾く）
+    Uri u;
+    try {
+      u = Uri.parse(url);
+    } catch (_) {
+      return false;
+    }
+    final scheme = u.scheme.toLowerCase();
+    if (scheme != "http" && scheme != "https") return false;
+
+    try {
+      // Windows: rundll32（なぜこの名: DLL関数を呼び出す実行ファイル）で既定ブラウザを開く
+      if (Platform.isWindows) {
+        await Process.start(
+          "rundll32",
+          ["url.dll,FileProtocolHandler", url],
+          runInShell: true,
+        );
+        return true;
+      }
+
+      // 将来のMac/Linux対応も一応（今はWindowsのみでもOK）
+      if (Platform.isMacOS) {
+        await Process.start("open", [url], runInShell: true);
+        return true;
+      }
+      if (Platform.isLinux) {
+        await Process.start("xdg-open", [url], runInShell: true);
+        return true;
+      }
+
+      return false;
+    } catch (e, st) {
+      await _logEvent("error", {
+        "where": "open_link",
+        "url": url,
+        "error": e.toString(),
+        "stack": st.toString(),
+      });
+      return false;
+    }
   }
 }
