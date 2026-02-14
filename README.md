@@ -75,6 +75,60 @@ nondesu は Gemini を直接呼び出します。**APIキーはあなた自身�
 }
 ```
 
+--- 
+## TTS（Text-to-Speech）
+nondesu はオプションで **音声読み上げ（TTS）** に対応しています。  
+現在はローカルで動く **AivisSpeech Engine** を想定しています。
+
+### 重要: AivisSpeech の `speaker` は「話者ID」ではなく `style_id`
+AivisSpeech は VOICEVOX 互換 API ですが、**音声合成 API の `speaker` パラメータに指定する値は `style_id` です**（互換性のため名前が `speaker` のまま）。:contentReference[oaicite:0]{index=0}  
+この `style_id` は **環境によって異なり、0 とは限りません**。必ず自分の環境で確認して設定してください。  
+また `style_id` は 32bit 符号付き整数の範囲で、大きい値になることがあります。
+
+### style_id の取得方法（おすすめ: Swagger UI）
+1. AivisSpeech Engine を起動する
+2. ブラウザで `http://127.0.0.1:10101/docs` を開く（Swagger UI）
+3. `GET /speakers` を開いて `Try it out` → `Execute`
+4. 返ってきた JSON の `styles` 配列から、使いたいスタイルの `id` を探す  
+   - 例: `[{ "name": "...", "id": 888753760 }, ...]` の **`id` が style_id**
+
+### style_id の取得方法（手早い: curl）
+PowerShell / ターミナルで以下を実行して `id` を確認します。
+
+```bash
+curl http://127.0.0.1:10101/speakers
+````
+
+（`jq` があるなら見やすくできます）
+
+```bash
+curl -s http://127.0.0.1:10101/speakers | jq '.[].styles[] | {name: .name, id: .id}'
+```
+
+### 設定（nondesu_config.json）
+
+例（値はダミーです。`default_style_id` は上で確認した style_id を入れてください）
+
+```json
+{
+  "tts": {
+    "enabled": true,
+    "provider": "aivis_speech",
+    "output_volume": 0.2,
+    "aivis_speech": {
+      "base_url": "http://127.0.0.1:10101",
+      "default_style_id": 888753760
+    }
+  }
+}
+```
+
+* `tts.enabled`: TTS を有効化
+* `tts.provider`: 使用するTTSサービス（現状は `"aivis_speech"`）
+* `tts.output_volume`: 再生音量（0.0〜1.0、デフォルト 0.2）
+* `tts.aivis_speech.base_url`: AivisSpeech Engine のURL（通常は `http://127.0.0.1:10101`）
+* `tts.aivis_speech.default_style_id`: **AivisSpeech の style_id（= speaker に渡す値）**
+
 ---
 
 ## 使い方（操作）
