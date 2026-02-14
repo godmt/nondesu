@@ -13,6 +13,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
   MascotPack? _pack;
   String? _selectedMascotId;
   AppConfig? _config;
+  Map<String, dynamic> _configRawJson = {};
   String? _configPath;
   late final TtsManager _tts;
   final Map<String, _RgbaMask> _maskCache = {};
@@ -610,6 +611,7 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     try {
       final raw = await f.readAsString();
       final obj = jsonDecode(raw);
+      _configRawJson = obj;
       if (obj is! Map) return template;
       // merge template defaults (missing keys only)
       final out = <String, dynamic>{...template};
@@ -1195,6 +1197,52 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
     };
   }
 
+  // 標準の JSON Schema（Ollama/OpenAI互換用）
+  Map<String, dynamic> _mascotTurnJsonSchema({required List<String> emotionEnum}) {
+    return {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": {"type": "integer"},
+        "text": {"type": "string"},
+        "emotion": {"type": "string", "enum": emotionEnum},
+        "choice_profile": {
+          "type": "string",
+          "enum": ["none", "idle_default", "rss_default", "input_offer"]
+        },
+        "choices": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "enum": ["c1", "c2", "c3"]},
+              "label": {"type": "string"},
+              "intent": {
+                "type": "string",
+                "enum": [
+                  "core.more",
+                  "core.change_topic",
+                  "core.quiet_mode",
+                  "core.ok",
+                  "core.nope",
+                  "core.open_input",
+                  "core.open_link"
+                ]
+              }
+            },
+            "required": ["id", "label", "intent"]
+          }
+        },
+        "debug_line_id": {"type": "string"}
+      },
+      "required": ["v", "text", "emotion", "choice_profile", "choices"]
+    };
+  }
+
+
   Future<MascotTurn> _callGeminiTurn({
     required String apiKey,
     required String model, // "gemini-3-flash-preview"
@@ -1282,66 +1330,259 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
 
     // response_mime_type=application/json なので text は JSON 文字列想定
     final obj = jsonDecode(text);
-    if (obj is! Map<String, dynamic>) {
+    if (obj is! Map) {
       throw Exception("Gemini: model output is not a JSON object");
     }
+    return _turnFromJsonObj(obj);
+  }
 
-    final turn = MascotTurn(
+  MascotTurn _turnFromJsonObj(Map obj) {
+    final choices = ((obj["choices"] as List?) ?? [])
+        .cast<Map>()
+        .map((m) => MascotChoice(
+              id: m["id"] as String,
+              label: m["label"] as String,
+              intent: MascotTurn.parseIntent(m["intent"] as String),
+            ))
+        .toList();
+
+    return MascotTurn(
       v: (obj["v"] as num).toInt(),
       text: obj["text"] as String,
       emotion: MascotTurn.parseEmotion(obj["emotion"] as String),
       choiceProfile: MascotTurn.parseChoiceProfile(obj["choice_profile"] as String),
-      choices: ((obj["choices"] as List?) ?? [])
-          .cast<Map<String, dynamic>>()
-          .map((m) => MascotChoice(
-                id: m["id"] as String,
-                label: m["label"] as String,
-                intent: MascotTurn.parseIntent(m["intent"] as String),
-              ))
-          .toList(),
-      debugLineId: (obj["debug_line_id"] as String?)?.trim().isEmpty == true ? null : (obj["debug_line_id"] as String?),
+      choices: choices,
+      debugLineId: (obj["debug_line_id"] as String?)?.trim().isEmpty == true
+          ? null
+          : (obj["debug_line_id"] as String?),
     );
-
-    return turn;
   }
 
+  // OpenAI互換 /v1/chat/completions 実装
+  String _extractJsonish(String s) {
+    var t = s.trim();
+    // code fence 剥がし
+    if (t.startsWith("```")) {
+      final lines = t.split('\n');
+      if (lines.isNotEmpty) lines.removeAt(0);
+      if (lines.isNotEmpty && lines.last.trim().startsWith("```")) lines.removeLast();
+      t = lines.join('\n').trim();
+    }
+    // 先頭{〜末尾} だけ抜く（前後に余計な文が付いた時の保険）
+    final i = t.indexOf('{');
+    final j = t.lastIndexOf('}');
+    if (i >= 0 && j > i) return t.substring(i, j + 1);
+    return t;
+  }
+
+  Future<MascotTurn> _callOpenAiCompatTurn({
+    required String baseUrl, // 例: https://api.openai.com/v1
+    required String apiKey,
+    required String model,
+    required String systemPrompt,
+    required String userPrompt,
+    required Map<String, dynamic> jsonSchema,
+    required String structuredOutputMode, // json_schema | json_object | none
+  }) async {
+    final uri = Uri.parse(baseUrl.endsWith('/') ? baseUrl : '$baseUrl/')
+        .resolve('chat/completions');
+
+    final messages = [
+      {"role": "system", "content": systemPrompt},
+      {
+        "role": "user",
+        "content": [
+          userPrompt,
+          "",
+          "SCHEMA(JSON Schema): ${jsonEncode(jsonSchema)}",
+          "Return ONLY a single JSON object that matches SCHEMA."
+        ].join("\n")
+      }
+    ];
+
+    final body = <String, dynamic>{
+      "model": model,
+      "messages": messages,
+      "temperature": 1.0,
+      "max_tokens": 2048,
+    };
+
+    if (structuredOutputMode == "json_schema") {
+      body["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": "mascot_turn", "schema": jsonSchema, "strict": true}
+      };
+    } else if (structuredOutputMode == "json_object") {
+      body["response_format"] = {"type": "json_object"};
+    }
+
+    final headers = <String, String>{
+      "Content-Type": "application/json",
+      if (apiKey.trim().isNotEmpty) "Authorization": "Bearer ${apiKey.trim()}",
+    };
+
+    final resp = await http.post(uri, headers: headers, body: jsonEncode(body));
+    if (resp.statusCode != 200) {
+      throw Exception("OpenAI-compat HTTP ${resp.statusCode}: ${resp.body}");
+    }
+
+    final decoded = jsonDecode(resp.body);
+    if (decoded is! Map) throw Exception("OpenAI-compat: response is not a JSON object");
+
+    final choicesAny = decoded["choices"];
+    if (choicesAny is! List || choicesAny.isEmpty) throw Exception("OpenAI-compat: no choices");
+
+    final msg = (choicesAny.first as Map)["message"];
+    final content = (msg is Map) ? (msg["content"]?.toString() ?? "") : "";
+    final jsonText = _extractJsonish(content);
+
+    final obj = jsonDecode(jsonText);
+    if (obj is! Map) throw Exception("OpenAI-compat: model output is not a JSON object");
+    return _turnFromJsonObj(obj);
+  }
+
+  // Ollama native /api/chat 実装
+  Future<MascotTurn> _callOllamaNativeTurn({
+    required String baseUrl, // 例: http://127.0.0.1:11434
+    required String model,
+    required String systemPrompt,
+    required String userPrompt,
+    required Map<String, dynamic> jsonSchema,
+  }) async {
+    final uri = Uri.parse(baseUrl.endsWith('/') ? baseUrl : '$baseUrl/')
+        .resolve('api/chat');
+
+    final body = <String, dynamic>{
+      "model": model,
+      "stream": false,
+      "messages": [
+        {"role": "system", "content": systemPrompt},
+        {"role": "user", "content": userPrompt},
+      ],
+      "format": jsonSchema,
+    };
+
+    final resp = await http.post(
+      uri,
+      headers: {"Content-Type": "application/json"},
+      body: jsonEncode(body),
+    );
+
+    if (resp.statusCode != 200) {
+      throw Exception("Ollama HTTP ${resp.statusCode}: ${resp.body}");
+    }
+
+    final decoded = jsonDecode(resp.body);
+    if (decoded is! Map) throw Exception("Ollama: response is not a JSON object");
+
+    final msg = decoded["message"];
+    final content = (msg is Map) ? (msg["content"]?.toString() ?? "") : "";
+    final jsonText = _extractJsonish(content);
+
+    final obj = jsonDecode(jsonText);
+    if (obj is! Map) throw Exception("Ollama: model output is not a JSON object");
+    return _turnFromJsonObj(obj);
+  }
+
+  
+  String _cfgStr(Map? root, String key) => (root?[key]?.toString() ?? "").trim();
+
+  // LLMルータ
   Future<MascotTurn?> _requestGeminiTurn({
-    required String where,        // "gemini_idle" / "gemini_rss" / "gemini_followup" など
-    required String mode,         // idle|rss|followup
-    required String from,         // ログ用（不要なら "" でもOK）
+    required String where,
+    required String mode,
+    required String from,
     required String userPrompt,
   }) async {
     final pack = _pack;
     if (pack == null) return null;
 
-    final cfg = _config;
-    if (cfg == null || cfg.geminiApiKey.trim().isEmpty) {
-      setState(() => _turn = MascotTurn.fallback(
-          "APIキー未設定。\n$_configFileName を exe と同じフォルダに置いて、gemini_api_key を書いて再起動して。\n($_configPath)"));
-      await _logEvent("error", {
-        "where": where,
-        "error": "missing_config_or_key",
-        "config_path": _configPath,
-      });
-      return null;
-    }
+    final root = _configRawJson; // raw config: Map<String,dynamic>?
+    final provider = _cfgStr(root, "llm_provider");
+    final llmProvider = provider.isEmpty ? "gemini" : provider;
 
-    // 多重呼び出し防止（クリック連打・別モード同時実行）
-
+    // 多重呼び出し防止は既存フラグ流用（名前はGeminiでも実態はLLM busy）
     if (_isGeminiBusy) return null;
-
-
     _setGeminiBusy(true);
-    _showBubble(); // busy中の …… を見せる前提
+    _showBubble();
+
     try {
-      final t = await _callGeminiTurn(
-        apiKey: cfg.geminiApiKey,
+      final schema = _mascotTurnJsonSchema(emotionEnum: pack.emotionIds);
+
+      if (llmProvider == "ollama") {
+        final baseUrl = _cfgStr(root, "ollama_base_url").isEmpty
+            ? "http://127.0.0.1:11434"
+            : _cfgStr(root, "ollama_base_url");
+        final model = _cfgStr(root, "ollama_model").isEmpty ? "gpt-oss" : _cfgStr(root, "ollama_model");
+        final useNative = (root?["ollama_use_native_api"] ?? true) == true;
+
+        if (useNative) {
+          return await _callOllamaNativeTurn(
+            baseUrl: baseUrl,
+            model: model,
+            systemPrompt: pack.systemPrompt,
+            userPrompt: userPrompt,
+            jsonSchema: schema,
+          );
+        }
+
+        // 互換APIを使いたい場合（schema強制は弱くなる可能性あり）
+        return await _callOpenAiCompatTurn(
+          baseUrl: baseUrl.endsWith("/v1") ? baseUrl : "$baseUrl/v1",
+          apiKey: _cfgStr(root, "openai_api_key").ifEmpty("ollama"),
+          model: model,
+          systemPrompt: pack.systemPrompt,
+          userPrompt: userPrompt,
+          jsonSchema: schema,
+          structuredOutputMode: "json_object",
+        );
+      }
+
+      if (llmProvider == "openai_compat") {
+        final baseUrl = _cfgStr(root, "openai_base_url").isEmpty
+            ? "https://api.openai.com/v1"
+            : _cfgStr(root, "openai_base_url");
+        final apiKey = _cfgStr(root, "openai_api_key");
+        final model = _cfgStr(root, "openai_model").isEmpty ? "gpt-4.1-mini" : _cfgStr(root, "openai_model");
+        final so = _cfgStr(root, "openai_structured_output").isEmpty
+            ? "json_schema"
+            : _cfgStr(root, "openai_structured_output");
+
+        if (apiKey.isEmpty) {
+          setState(() => _turn = MascotTurn.fallback("OpenAI互換APIキー未設定。nondesu_config.json の openai_api_key を設定して再起動して。"));
+          await _logEvent("error", {"where": where, "error": "missing_openai_api_key"});
+          return null;
+        }
+
+        return await _callOpenAiCompatTurn(
+          baseUrl: baseUrl,
+          apiKey: apiKey,
+          model: model,
+          systemPrompt: pack.systemPrompt,
+          userPrompt: userPrompt,
+          jsonSchema: schema,
+          structuredOutputMode: so,
+        );
+      }
+
+      // default: gemini
+      final cfg = _config;
+      final apiKey = (cfg?.geminiApiKey ?? "").trim();
+      if (apiKey.isEmpty) {
+        setState(() => _turn = MascotTurn.fallback(
+            "Gemini APIキー未設定。\n$_configFileName を exe と同じフォルダに置いて、gemini_api_key を書いて再起動して。\n($_configPath)"));
+        await _logEvent("error", {"where": where, "error": "missing_gemini_api_key", "config_path": _configPath});
+        return null;
+      }
+
+      // 既存のGemini Structured Output呼び出し（そのまま）
+      return await _callGeminiTurn(
+        apiKey: apiKey,
         model: "gemini-3-flash-preview",
         systemPrompt: pack.systemPrompt,
         userPrompt: userPrompt,
         emotionEnum: pack.emotionIds,
       );
-      return t;
     } catch (e, st) {
       await _logEvent("error", {
         "where": where,
@@ -2062,4 +2303,9 @@ class _MascotHomeState extends State<MascotHome> with WindowListener {
       return false;
     }
   }
+}
+
+// 小物: String拡張
+extension on String {
+  String ifEmpty(String v) => trim().isEmpty ? v : this;
 }
